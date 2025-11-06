@@ -19,11 +19,13 @@ import re
 import sys
 import shutil
 import traceback
+import json
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 
 import streamlit as st
 import requests
@@ -67,7 +69,12 @@ BASE = HERE / "BSD"
 DL_DIR = BASE / "Downloads"
 EX_DIR = BASE / "Excerpts"
 CP_DIR = BASE / "Compiled"
-for d in (DL_DIR, EX_DIR, CP_DIR): d.mkdir(parents=True, exist_ok=True)
+MAN_DIR = BASE / "Manifests"   # run manifests (Document Checker + incremental)
+DELTA_DIR = BASE / "Delta"     # delta PDFs + JSONs (Document Checker)
+for d in (DL_DIR, EX_DIR, CP_DIR, MAN_DIR, DELTA_DIR):
+    d.mkdir(parents=True, exist_ok=True)
+
+ai_insights = _import("ai_insights", HERE / "ai_insights.py")
 
 # ---- BIG LIST → 7 batches (no repeats) ----
 _BIG_LIST_RAW = r"""
@@ -576,13 +583,14 @@ def _set_quarter(page, wanted: str) -> bool:
     page.wait_for_timeout(250)
     return True
 
-
 def _search_by_fund(page, keyword: str) -> None:
     inp = page.locator(FILTERS["fund"]).first
     inp.fill(""); inp.type(keyword, delay=10)
     page.locator(FILTERS["search_btn"]).first.click(force=True)
-    try: page.wait_for_load_state("networkidle", timeout=8000)
-    except Exception: page.locator(TABLE_ROW).first.wait_for(state="visible", timeout=8000)
+    try:
+        page.wait_for_load_state("networkidle", timeout=8000)
+    except Exception:
+        page.locator(TABLE_ROW).first.wait_for(state="visible", timeout=8000)
 
 def _parse_rows(page, quarter: str) -> List[Hit]:
     rows = page.locator(TABLE_ROW)
@@ -591,45 +599,61 @@ def _parse_rows(page, quarter: str) -> List[Hit]:
         row = rows.nth(i)
         try:
             q = row.locator("td").nth(COLMAP["quarter"]-1).inner_text().strip()
-            if q != quarter: continue
+            if q != quarter:
+                continue
             letter_date = row.locator("td").nth(COLMAP["letter_date"]-1).inner_text().strip()
             fund_cell = row.locator("td").nth(COLMAP["fund_name"]-1)
             link = fund_cell.locator("a").first
             fund_name = (link.inner_text() or '').strip()
             fund_href = link.get_attribute("href") or ""
-            if fund_href: hits.append(Hit(q, letter_date, fund_name, fund_href))
-        except Exception: continue
+            if fund_href:
+                hits.append(Hit(q, letter_date, fund_name, fund_href))
+        except Exception:
+            continue
     return hits
 
 def _download_quarter_pdf_from_fund(page, quarter: str, dest_dir: Path) -> List[Path]:
     dest_dir.mkdir(parents=True, exist_ok=True)
     pdfs: List[Path] = []
-    try: page.locator("text=Quarterly Letters").first.wait_for(state="visible", timeout=8000)
-    except Exception: pass
-    anchors = page.locator("a").all(); candidates = []
+    try:
+        page.locator("text=Quarterly Letters").first.wait_for(state="visible", timeout=8000)
+    except Exception:
+        pass
+    anchors = page.locator("a").all()
+    candidates = []
     for a in anchors:
         try:
             text = (a.inner_text() or '').strip()
             title = a.get_attribute("title") or ""
             href = a.get_attribute("href") or ""
-            if not href: continue
+            if not href:
+                continue
             if (text == quarter or quarter in title) and ("letters/file" in href or href.lower().endswith('.pdf')):
                 candidates.append((a, href))
-        except Exception: continue
+        except Exception:
+            continue
     for a, href in candidates:
         try:
-            with page.expect_download(timeout=8000) as dl_info: a.click(force=True)
+            with page.expect_download(timeout=8000) as dl_info:
+                a.click(force=True)
             dl = dl_info.value
             fname = _safe(Path(dl.suggested_filename or Path(href).name or f"{quarter}.pdf").name)
-            path = dest_dir / fname; dl.save_as(str(path)); pdfs.append(path); continue
-        except Exception: pass
+            path = dest_dir / fname
+            dl.save_as(str(path))
+            pdfs.append(path)
+            continue
+        except Exception:
+            pass
         try:
             r = requests.get(href, timeout=20)
             if r.status_code == 200 and r.content:
-                fname = _safe(Path(href).name or f"{quarter}.pdf"); path = dest_dir / fname
-                with open(path, 'wb') as f: f.write(r.content)
+                fname = _safe(Path(href).name or f"{quarter}.pdf")
+                path = dest_dir / fname
+                with open(path, 'wb') as f:
+                    f.write(r.content)
                 pdfs.append(path)
-        except Exception: continue
+        except Exception:
+            continue
     return pdfs
 
 # excerption + build
@@ -643,9 +667,11 @@ def run_excerpt_and_build(pdf_path: Path, out_dir: Path, source_pdf_name: Option
             (HERE / "tickers.py").exists() and shutil.copy2(HERE / "tickers.py", tp)
         excerpt_check.excerpt_pdf_for_tickers(str(pdf_path), debug=False)
         src_json = pdf_path.parent / "excerpts_clean.json"
-        if not src_json.exists(): return None
+        if not src_json.exists():
+            return None
         dst_json = out_dir / "excerpts_clean.json"
-        if src_json != dst_json: shutil.copy2(src_json, dst_json)
+        if src_json != dst_json:
+            shutil.copy2(src_json, dst_json)
         out_pdf = out_dir / f"Excerpted_{_safe(pdf_path.stem)}.pdf"
         make_pdf.build_pdf(
             excerpts_json_path=str(dst_json),
@@ -653,55 +679,254 @@ def run_excerpt_and_build(pdf_path: Path, out_dir: Path, source_pdf_name: Option
             report_title=f"Cutler Capital Excerpts – {pdf_path.stem}",
             source_pdf_name=source_pdf_name or pdf_path.name,
             format_style="legacy",
-            letter_date=letter_date 
+            letter_date=letter_date
         )
         return out_pdf if out_pdf.exists() else None
     except Exception:
-        traceback.print_exc(); return None
+        traceback.print_exc()
+        return None
 
 # stamping + compile
 
 def _overlay_single_page(w: float, h: float, left: str, mid: str, right: str) -> BytesIO:
-    buf = BytesIO(); c = canvas.Canvas(buf, pagesize=(w, h))
-    c.setFont("Helvetica", 8.5); c.setFillColor(colors.HexColor("#4b2142"))  # Cutler purple
-    L = R = 0.75 * 72; T = 0.75 * 72
-    if left: c.drawString(L, h - T + 0.35 * 72, left)
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=(w, h))
+    c.setFont("Helvetica", 8.5)
+    c.setFillColor(colors.HexColor("#4b2142"))  # Cutler purple
+    L = R = 0.75 * 72
+    T = 0.75 * 72
+    if left:
+        c.drawString(L, h - T + 0.35 * 72, left)
     if mid:
         text = (mid[:95] + '…') if len(mid) > 96 else mid
         c.drawCentredString(w / 2.0, h - T + 0.35 * 72, text)
-    if right: c.drawRightString(w - R, h - T + 0.35 * 72, right)
-    c.save(); buf.seek(0); return buf
+    if right:
+        c.drawRightString(w - R, h - T + 0.35 * 72, right)
+    c.save()
+    buf.seek(0)
+    return buf
 
 def _stamp_pdf(src: Path, left: str, mid: str, right: str) -> Path:
-    try: r = _PdfReader(str(src))
-    except Exception: return src
+    try:
+        r = _PdfReader(str(src))
+    except Exception:
+        return src
     w = _PdfWriter()
     for pg in r.pages:
-        W = float(pg.mediabox.width); H = float(pg.mediabox.height)
+        W = float(pg.mediabox.width)
+        H = float(pg.mediabox.height)
         ov = _PdfReader(_overlay_single_page(W, H, left, mid, right)).pages[0]
-        try: pg.merge_page(ov)
-        except Exception: pass
+        try:
+            pg.merge_page(ov)
+        except Exception:
+            pass
         w.add_page(pg)
     tmp = src.with_suffix('.stamped.tmp.pdf')
-    with open(tmp, 'wb') as f: w.write(f)
+    with open(tmp, 'wb') as f:
+        w.write(f)
     return tmp
 
 def compile_merged(batch: str, quarter: str, collected: List[Path]) -> Optional[Path]:
-    if not collected: return None
+    if not collected:
+        return None
     out = CP_DIR / f"Compiled_Cutler_{batch.replace(' ', '')}_{quarter}_{datetime.now():%Y%m%d_%H%M%S}.pdf"
-    m = PdfMerger(); added = 0
+    m = PdfMerger()
+    added = 0
     for p in collected:
         try:
             title = p.stem.replace('_', ' ').replace('-', ' ')
             stamped = _stamp_pdf(p, left=batch, mid=title, right=f"Run {datetime.now():%Y-%m-%d %H:%M}")
-            m.append(str(stamped)); added += 1
-        except Exception: continue
+            m.append(str(stamped))
+            added += 1
+        except Exception:
+            continue
     if not added:
         m.close()
         return None
-    try: m.write(str(out))
-    finally: m.close()
+    try:
+        m.write(str(out))
+    finally:
+        m.close()
     return out
+
+# ---------- Manifest + Delta helpers ----------
+
+def _write_manifest(
+    batch: str,
+    quarter: str,
+    compiled: Optional[Path],
+    items: List[Dict[str, Any]],
+    table_rows: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Path]:
+    """
+    Store a small JSON manifest for a compiled (or incremental) run so the
+    Document Checker and incremental updater can compare runs later.
+    """
+    try:
+        qdir = MAN_DIR / quarter
+        qdir.mkdir(parents=True, exist_ok=True)
+        now = datetime.now()
+        payload: Dict[str, Any] = {
+            "batch": batch,
+            "quarter": quarter,
+            "compiled_pdf": str(compiled) if compiled else "",
+            "created_at": now.isoformat(timespec="seconds"),
+            "items": items,
+        }
+        if table_rows is not None:
+            payload["table_rows"] = table_rows
+
+        fname = qdir / f"manifest_{batch.replace(' ', '')}_{now:%Y%m%d_%H%M%S}.json"
+        with open(fname, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        return fname
+    except Exception:
+        traceback.print_exc()
+        return None
+
+def _load_manifests(batch: str, quarter: str) -> List[Dict[str, Any]]:
+    """
+    Load all manifests for a given batch + quarter, newest first.
+    """
+    qdir = MAN_DIR / quarter
+    if not qdir.exists():
+        return []
+    out: List[Dict[str, Any]] = []
+    for p in qdir.glob("manifest_*.json"):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("batch") != batch or data.get("quarter") != quarter:
+                continue
+            data["_path"] = str(p)
+            out.append(data)
+        except Exception:
+            continue
+    out.sort(key=lambda m: m.get("created_at", ""), reverse=True)
+    return out
+
+def _normalize_para_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+def _collect_keys_from_manifest(manifest: Dict[str, Any]) -> set:
+    """
+    Build a set of (fund, source_pdf, ticker, text_hash) keys for all narrative
+    paragraphs in a manifest. Used to detect whether a paragraph is "new".
+    """
+    keys = set()
+    for meta in manifest.get("items", []):
+        ej = meta.get("excerpts_json")
+        if not ej:
+            continue
+        p = Path(ej)
+        if not p.exists():
+            continue
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        for ticker, lst in data.items():
+            if not isinstance(lst, list):
+                continue
+            for item in lst:
+                txt_norm = _normalize_para_text(item.get("text", ""))
+                if not txt_norm:
+                    continue
+                h = hashlib.sha1(txt_norm.encode("utf-8")).hexdigest()
+                key = (
+                    meta.get("fund_family", ""),
+                    meta.get("source_pdf_name", ""),
+                    str(ticker),
+                    h,
+                )
+                keys.add(key)
+    return keys
+
+def build_delta_pdf(old_manifest: Dict[str, Any], new_manifest: Dict[str, Any]) -> Optional[Path]:
+    """
+    Compare two manifests (older vs newer) and build a PDF containing ONLY
+    paragraphs that are new in the newer manifest.
+
+    Returns the PDF path, or None if no new paragraphs were found.
+    """
+    old_keys = _collect_keys_from_manifest(old_manifest)
+    aggregated: Dict[str, List[Dict[str, Any]]] = {}
+
+    for meta in new_manifest.get("items", []):
+        ej = meta.get("excerpts_json")
+        if not ej:
+            continue
+        p = Path(ej)
+        if not p.exists():
+            continue
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+
+        for ticker, lst in data.items():
+            if not isinstance(lst, list):
+                continue
+            for item in lst:
+                txt = item.get("text", "")
+                norm = _normalize_para_text(txt)
+                if not norm:
+                    continue
+                h = hashlib.sha1(norm.encode("utf-8")).hexdigest()
+                key = (
+                    meta.get("fund_family", ""),
+                    meta.get("source_pdf_name", ""),
+                    str(ticker),
+                    h,
+                )
+                if key in old_keys:
+                    continue  # already existed in the older run
+
+                pages = item.get("pages") or []
+                decorated = f"[{meta.get('fund_family', 'Unknown')} – {meta.get('source_pdf_name', '')}] {txt}"
+                aggregated.setdefault(str(ticker), []).append(
+                    {"text": decorated, "pages": pages}
+                )
+
+    if not aggregated:
+        return None
+
+    DELTA_DIR.mkdir(parents=True, exist_ok=True)
+    batch = new_manifest.get("batch", "Batch")
+    quarter = new_manifest.get("quarter", "Quarter")
+    old_id = (old_manifest.get("created_at", "old")
+              .replace(":", "").replace("-", "").replace("T", "_"))
+    new_id = (new_manifest.get("created_at", "new")
+              .replace(":", "").replace("-", "").replace("T", "_"))
+
+    json_path = DELTA_DIR / f"delta_{batch.replace(' ', '')}_{quarter}_{old_id}_to_{new_id}.json"
+    pdf_path = DELTA_DIR / f"Delta_Cutler_{batch.replace(' ', '')}_{quarter}_{old_id}_to_{new_id}.pdf"
+
+    try:
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(aggregated, f, indent=2, ensure_ascii=False)
+
+        make_pdf.build_pdf(
+            excerpts_json_path=str(json_path),
+            output_pdf_path=str(pdf_path),
+            report_title="New ticker commentary vs prior run",
+            source_pdf_name=f"{batch.replace(' ', '')}_{quarter}_Delta",
+            format_style="legacy",
+            letter_date=None,
+        )
+    except Exception:
+        traceback.print_exc()
+        return None
+
+    return pdf_path if pdf_path.exists() else None
+
+# ---------- Quarter helpers ----------
 
 @st.cache_data(show_spinner=False)
 def get_available_quarters() -> List[str]:
@@ -756,7 +981,6 @@ def get_available_quarters() -> List[str]:
         ]
     return out
 
-
 def _parse_quarter_label(label: str) -> Optional[Tuple[int, int]]:
     """
     Parse 'YYYY QN' into (YYYY, N). Returns None if it doesn't match.
@@ -766,7 +990,6 @@ def _parse_quarter_label(label: str) -> Optional[Tuple[int, int]]:
         return None
     return int(m.group(1)), int(m.group(2))
 
-
 def _last_completed_us_quarter(today: Optional[datetime] = None) -> Tuple[int, int]:
     """
     Given today's date, return (year, quarter) for the **last completed US quarter**.
@@ -775,12 +998,6 @@ def _last_completed_us_quarter(today: Optional[datetime] = None) -> Tuple[int, i
       Q2: Apr–Jun
       Q3: Jul–Sep
       Q4: Oct–Dec
-
-    Example:
-      - Today: 2025-11-06 (Nov 6, 2025, in Q4)
-        -> last completed = (2025, 3)  i.e., '2025 Q3'
-      - Today: 2025-02-10 (Feb, in Q1)
-        -> last completed = (2024, 4)  i.e., '2024 Q4'
     """
     if today is None:
         today = datetime.now()
@@ -788,27 +1005,19 @@ def _last_completed_us_quarter(today: Optional[datetime] = None) -> Tuple[int, i
     m = today.month
 
     if 1 <= m <= 3:
-        # In Q1 -> last completed is previous year's Q4
         return y - 1, 4
     elif 4 <= m <= 6:
-        # In Q2 -> last completed is Q1 of the same year
         return y, 1
     elif 7 <= m <= 9:
-        # In Q3 -> last completed is Q2 of the same year
         return y, 2
     else:
-        # In Q4 -> last completed is Q3 of the same year
         return y, 3
-
 
 def choose_default_quarter(available: List[str]) -> Optional[str]:
     """
     Given the list of available quarters from the site, choose the default
     as the **last completed US quarter**, if present. If not present,
     choose the most recent available.
-
-    This ensures that on 2025-11-06 the default is '2025 Q3', even if
-    '2025 Q4' or future years appear in the dropdown.
     """
     if not available:
         return None
@@ -827,15 +1036,13 @@ def choose_default_quarter(available: List[str]) -> Optional[str]:
 
     target_year, target_q = _last_completed_us_quarter()
 
-    # Prefer the latest quarter that is <= the last completed quarter
     for lab, year, q in parsed:
         if year < target_year or (year == target_year and q <= target_q):
             return lab
 
-    # If none <= target (extreme edge case), fall back to newest available
     return parsed[0][0]
 
-# run one batch
+# ---------- run one batch (full run, with manifest + table rows) ----------
 
 def run_batch(batch_name: str, quarters: List[str], use_first_word: bool, subset: Optional[List[str]] = None):
     st.markdown(f"### Running {batch_name}")
@@ -850,7 +1057,8 @@ def run_batch(batch_name: str, quarters: List[str], use_first_word: bool, subset
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         ctx = browser.new_context(accept_downloads=True)
-        page = ctx.new_page(); page.set_default_timeout(15000)
+        page = ctx.new_page()
+        page.set_default_timeout(15000)
         page.goto(BSD_URL)
 
         for q in quarters:
@@ -864,6 +1072,8 @@ def run_batch(batch_name: str, quarters: List[str], use_first_word: bool, subset
                 continue
 
             outs: List[Path] = []
+            manifest_items: List[Dict[str, Any]] = []
+            table_rows: List[Dict[str, Any]] = []  # snapshot of table rows
 
             for i, (brand, token) in enumerate(tokens, 1):
                 st.write(f"[{q}] {i}/{len(tokens)} — {brand} (search: {token})")
@@ -874,11 +1084,24 @@ def run_batch(batch_name: str, quarters: List[str], use_first_word: bool, subset
                         continue
                     seen = set()
                     for h in hits:
+                        # record table row
+                        table_rows.append(
+                            {
+                                "fund_family": brand,
+                                "search_token": token,
+                                "quarter": h.quarter,
+                                "letter_date": h.letter_date,
+                                "fund_name": h.fund_name,
+                                "fund_href": h.fund_href,
+                            }
+                        )
+
                         if h.fund_href in seen:
                             continue
                         seen.add(h.fund_href)
                         page.goto(h.fund_href)
                         page.wait_for_load_state("domcontentloaded")
+
                         dest = DL_DIR / q / _safe(brand)
                         pdfs = _download_quarter_pdf_from_fund(page, q, dest)
                         for pdf in pdfs:
@@ -889,8 +1112,25 @@ def run_batch(batch_name: str, quarters: List[str], use_first_word: bool, subset
                                 source_pdf_name=pdf.name,
                                 letter_date=h.letter_date or None,
                             )
+
+                            manifest_items.append(
+                                {
+                                    "fund_family": brand,
+                                    "search_token": token,
+                                    "letter_date": h.letter_date or "",
+                                    "downloaded_pdf": str(pdf),
+                                    "source_pdf_name": pdf.name,
+                                    "excerpt_dir": str(out_dir),
+                                    "excerpts_json": str(out_dir / "excerpts_clean.json"),
+                                    "excerpt_pdf": str(built) if built else "",
+                                    "fund_name": h.fund_name,
+                                    "fund_href": h.fund_href,
+                                }
+                            )
+
                             if built:
                                 outs.append(built)
+
                         page.go_back()
                         page.wait_for_load_state("domcontentloaded")
                 except Exception as e:
@@ -905,9 +1145,200 @@ def run_batch(batch_name: str, quarters: List[str], use_first_word: bool, subset
                     f"No excerpt PDFs produced for **{q}**. "
                     "The selected fund families may not yet have letters or ticker mentions for this quarter."
                 )
+
+            # write manifest regardless (so we capture table_rows snapshot)
+            _write_manifest(batch_name, q, compiled, manifest_items, table_rows=table_rows)
+
         browser.close()
 
-# UI
+# ---------- NEW: incremental per-batch updater ----------
+
+def _row_key(row: Dict[str, Any]) -> Tuple[str, str, str, str, str]:
+    """
+    Build a stable key for a table row so we can compare snapshots.
+    """
+    return (
+        row.get("fund_family", ""),
+        row.get("fund_name", ""),
+        row.get("quarter", ""),
+        row.get("letter_date", ""),
+        row.get("fund_href", ""),
+    )
+
+def run_incremental_update(batch_name: str, quarter: str, use_first_word: bool):
+    """
+    Fast per-batch incremental mode:
+      - Reads the latest manifest for (batch, quarter) to get previous table_rows.
+      - Scans the BSD table now (no downloads yet).
+      - If table_rows unchanged => nothing to do.
+      - If some rows are new/changed => downloads and processes only those.
+    """
+    st.markdown(f"### Incremental update – {batch_name} / {quarter}")
+
+    manifests = _load_manifests(batch_name, quarter)
+    if not manifests:
+        st.info(
+            "No manifest history found yet for this batch and quarter. "
+            "Run a full batch once under 'Run scope' before using incremental mode."
+        )
+        return
+
+    latest = manifests[0]
+    prev_rows = latest.get("table_rows")
+    if not prev_rows:
+        st.info(
+            "Latest manifest for this batch and quarter does not contain table-level "
+            "snapshot data (likely created before the incremental feature). "
+            "Run a full batch once so the next manifest includes table_rows, "
+            "then use incremental mode."
+        )
+        return
+
+    prev_key_set = { _row_key(r) for r in prev_rows }
+
+    brands = RUNNABLE_BATCHES.get(batch_name, [])
+    if not brands:
+        st.info("No runnable fund families in this batch.")
+        return
+
+    tokens = [(b, _first_word(b) if use_first_word else b) for b in brands]
+
+    current_rows: List[Dict[str, Any]] = []
+    row_by_key: Dict[Tuple[str, str, str, str, str], Dict[str, Any]] = {}
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        ctx = browser.new_context(accept_downloads=True)
+        page = ctx.new_page()
+        page.set_default_timeout(15000)
+        page.goto(BSD_URL)
+
+        st.write(f"Scanning BSD table for {batch_name} / {quarter} (no downloads yet)…")
+
+        if not _set_quarter(page, quarter):
+            st.warning(
+                f"Quarter **{quarter}** is not available on the data source at the moment. "
+                "It may not have any letters yet."
+            )
+            browser.close()
+            return
+
+        # scan table rows for all brands
+        for i, (brand, token) in enumerate(tokens, 1):
+            st.write(f"[{quarter}] {i}/{len(tokens)} — {brand} (search: {token})")
+            try:
+                _search_by_fund(page, token)
+                hits = _parse_rows(page, quarter)
+                for h in hits:
+                    row = {
+                        "fund_family": brand,
+                        "search_token": token,
+                        "quarter": h.quarter,
+                        "letter_date": h.letter_date,
+                        "fund_name": h.fund_name,
+                        "fund_href": h.fund_href,
+                    }
+                    key = _row_key(row)
+                    current_rows.append(row)
+                    row_by_key[key] = row
+            except Exception as e:
+                st.error(f"Error scanning fund family {brand}: {e}")
+                continue
+
+        # Compare snapshots
+        current_key_set = set(row_by_key.keys())
+        new_keys = current_key_set - prev_key_set
+
+        if not new_keys:
+            st.success(
+                "No new or changed letters detected for this batch and quarter "
+                "compared to the latest manifest. Nothing to download today."
+            )
+            # Still write a snapshot-only manifest so next comparison is up to date
+            _write_manifest(batch_name, quarter, compiled=None, items=[], table_rows=current_rows)
+            browser.close()
+            return
+
+        st.write(f"Found {len(new_keys)} new or changed table rows. Downloading only those…")
+
+        outs: List[Path] = []
+        manifest_items: List[Dict[str, Any]] = []
+
+        processed_hrefs: set = set()
+
+        for key in new_keys:
+            row = row_by_key[key]
+            href = row.get("fund_href") or ""
+            brand = row.get("fund_family") or ""
+            token = row.get("search_token") or ""
+            letter_date = row.get("letter_date") or ""
+            fund_name = row.get("fund_name") or ""
+
+            if not href or not brand:
+                continue
+            if href in processed_hrefs:
+                continue
+            processed_hrefs.add(href)
+
+            try:
+                st.write(f"Downloading new/updated letter for {brand} – {fund_name} ({letter_date})")
+                page.goto(href)
+                page.wait_for_load_state("domcontentloaded")
+
+                dest = DL_DIR / quarter / _safe(brand)
+                pdfs = _download_quarter_pdf_from_fund(page, quarter, dest)
+                for pdf in pdfs:
+                    out_dir = EX_DIR / quarter / _safe(brand) / _safe(pdf.stem)
+                    built = run_excerpt_and_build(
+                        pdf,
+                        out_dir,
+                        source_pdf_name=pdf.name,
+                        letter_date=letter_date or None,
+                    )
+
+                    manifest_items.append(
+                        {
+                            "fund_family": brand,
+                            "search_token": token,
+                            "letter_date": letter_date,
+                            "downloaded_pdf": str(pdf),
+                            "source_pdf_name": pdf.name,
+                            "excerpt_dir": str(out_dir),
+                            "excerpts_json": str(out_dir / "excerpts_clean.json"),
+                            "excerpt_pdf": str(built) if built else "",
+                            "fund_name": fund_name,
+                            "fund_href": href,
+                        }
+                    )
+
+                    if built:
+                        outs.append(built)
+            except Exception as e:
+                st.error(f"Error downloading for {brand}: {e}")
+                continue
+
+        compiled = None
+        if outs:
+            compiled = compile_merged(batch_name, quarter, outs)
+            if compiled:
+                st.success(f"Incremental compiled PDF created: {compiled}")
+            else:
+                st.info(
+                    "New letters were found, but no excerpt PDFs were produced. "
+                    "They may not contain any tracked tickers."
+                )
+        else:
+            st.info(
+                "New letters were detected in the table, but their PDFs could not be "
+                "downloaded or yielded no excerpts."
+            )
+
+        # Write manifest capturing current snapshot + any new items we processed
+        _write_manifest(batch_name, quarter, compiled, manifest_items, table_rows=current_rows)
+
+        browser.close()
+
+# ---------- UI ----------
 
 def main():
     st.set_page_config(page_title="Cutler Capital Scraper", layout="wide")
@@ -921,8 +1352,7 @@ def main():
             background: radial-gradient(circle at top left, #f5f0fb 0, #ffffff 40%, #f7f3fb 100%);
         }
         .block-container {
-            /* give enough top space so the logo sits fully below the Streamlit header */
-            padding-top: 4rem;         /* was 1.5rem */
+            padding-top: 4rem;
             max-width: 1100px;
         }
         .app-title {
@@ -948,7 +1378,6 @@ def main():
             color: #4b2142;
         }
         
-         /* ─────────── HEADER / TOP BAR UNIFICATION ─────────── */
         header[data-testid="stHeader"] {
             background: radial-gradient(circle at top left, #f5f0fb 0, #ffffff 40%, #f7f3fb 100%) !important;
             box-shadow: none !important;
@@ -977,15 +1406,15 @@ def main():
             border-color: #612a58;
         }
 
-         /* Radio group as pill toggle */
+        /* Radio group as pill toggle */
         div[role="radiogroup"] {
             display: flex;
             flex-wrap: nowrap;
             gap: 0.4rem;
         }
         div[role="radiogroup"] > label {
-            flex: 1 1 0;                    /* make both options same width */
-            justify-content: center;        /* center the text */
+            flex: 1 1 0;
+            justify-content: center;
             border-radius: 999px !important;
             padding: 0.35rem 0.95rem !important;
             border: 1px solid #d7c4f3 !important;
@@ -997,7 +1426,6 @@ def main():
         div[role="radiogroup"] > label:hover {
             border-color: #4b2142 !important;
         }
-        /* Selected radio */
         div[role="radiogroup"] > label[data-baseweb="radio"] > div:first-child > div[aria-checked="true"] + div {
             background: #4b2142 !important;
         }
@@ -1025,6 +1453,53 @@ def main():
             border:1px solid rgba(75,33,66,0.35);
             white-space:nowrap;
         }
+
+        /* Gauge (needle) */
+        .gauge-wrapper {
+            margin-top: 0.5rem;
+            margin-bottom: 0.75rem;
+        }
+        .gauge {
+            width: 220px;
+            height: 120px;
+            margin: 0.2rem auto 0.1rem;
+            position: relative;
+        }
+        .gauge-body {
+            width: 100%;
+            height: 100%;
+            border-radius: 220px 220px 0 0;
+            background: #f5effc;
+            border: 1px solid rgba(75,33,66,0.25);
+            position: relative;
+            overflow: hidden;
+        }
+        .gauge-needle {
+            position: absolute;
+            width: 2px;
+            height: 85%;
+            top: 15%;
+            left: 50%;
+            background: #4b2142;
+            transform-origin: bottom center;
+            transition: transform 0.25s ease-out;
+        }
+        .gauge-cover {
+            width: 68%;
+            height: 68%;
+            background: #ffffff;
+            border-radius: 50%;
+            position: absolute;
+            bottom: -10%;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 0.9rem;
+            color: #4b2142;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -1035,7 +1510,6 @@ def main():
     col_left, col_center, col_right = st.columns([1, 2, 1])
     with col_center:
         if logo_path.exists():
-            # Fixed width so the whole logo is visible and centered
             st.image(str(logo_path), width=260)
         st.markdown("<div class='app-title'>Cutler Capital Letter Scraper</div>", unsafe_allow_html=True)
         st.markdown(
@@ -1046,10 +1520,7 @@ def main():
     # Sidebar: run settings
     st.sidebar.header("Run settings")
 
-    # Get available quarters dynamically from the site
     quarter_options = get_available_quarters()
-
-    # Choose default as the last completed US quarter (e.g., 2025 Q3 on 2025-11-06)
     default_q = choose_default_quarter(quarter_options)
 
     quarters = st.sidebar.multiselect(
@@ -1065,7 +1536,7 @@ def main():
 
     batch_names = list(RUNNABLE_BATCHES.keys())
 
-    # Main controls in a card
+    # Main controls in a card – full run
     with st.container():
         st.markdown("<div class='cc-card'>", unsafe_allow_html=True)
         st.markdown("#### Run scope", unsafe_allow_html=True)
@@ -1111,6 +1582,276 @@ def main():
                     run_batch(selected_batch, quarters, use_first_word, subset=subset)
 
         st.markdown("</div>", unsafe_allow_html=True)
+
+    # Incremental per-batch updater
+    st.markdown("<div class='cc-card'>", unsafe_allow_html=True)
+    st.markdown("#### Incremental update (per batch)", unsafe_allow_html=True)
+    st.write(
+        "Use this when interns run the tool daily. It compares the current BSD table "
+        "to the latest stored manifest for a batch and quarter, and only downloads "
+        "letters that are new or changed."
+    )
+
+    inc_quarter = st.selectbox(
+        "Quarter for incremental check",
+        options=quarter_options,
+        index=quarter_options.index(default_q) if default_q in quarter_options else 0,
+        key="inc_quarter",
+    )
+    inc_batch = st.selectbox(
+        "Batch for incremental update",
+        options=batch_names,
+        index=0,
+        key="inc_batch",
+    )
+
+    if st.button("Check for updates and download new letters", key="inc_btn"):
+        run_incremental_update(inc_batch, inc_quarter, use_first_word)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # Document Checker
+    st.markdown("<div class='cc-card'>", unsafe_allow_html=True)
+    st.markdown("#### Document Checker", unsafe_allow_html=True)
+    st.write(
+        "Compare two compiled runs for a given batch and quarter, and generate a PDF "
+        "containing only **new** ticker-related paragraphs found in the newer run."
+    )
+
+    checker_quarter = st.selectbox(
+        "Quarter to inspect",
+        options=quarter_options,
+        index=quarter_options.index(default_q) if default_q in quarter_options else 0,
+        key="checker_quarter",
+    )
+    checker_batch = st.selectbox(
+        "Batch",
+        options=batch_names,
+        index=0,
+        key="checker_batch",
+    )
+
+    manifests = _load_manifests(checker_batch, checker_quarter)
+    if not manifests:
+        st.info(
+            "No history found yet for this batch and quarter. "
+            "Run the scraper at least twice to compare documents."
+        )
+    elif len(manifests) == 1:
+        only = manifests[0]
+        st.info(
+            "Only one compiled run is stored so far for this batch and quarter "
+            f"(created {only.get('created_at', '')}). Run the scraper again to "
+            "create a second run for comparison."
+        )
+    else:
+        labels = [
+            f"{i+1}. {m.get('created_at', '')} – {Path(m.get('compiled_pdf', '')).name or '[no compiled PDF]'}"
+            for i, m in enumerate(manifests)
+        ]
+        idx_new = 0
+        idx_old = 1 if len(manifests) > 1 else 0
+
+        new_idx = st.selectbox(
+            "Newer run",
+            options=list(range(len(manifests))),
+            format_func=lambda i: labels[i],
+            index=idx_new,
+            key="checker_new",
+        )
+        old_idx = st.selectbox(
+            "Older run to compare against",
+            options=list(range(len(manifests))),
+            format_func=lambda i: labels[i],
+            index=idx_old,
+            key="checker_old",
+        )
+
+        if new_idx == old_idx:
+            st.warning("Please select two different runs to compare.")
+        else:
+            if st.button("Generate 'New Since' PDF", key="checker_btn"):
+                delta_pdf = build_delta_pdf(
+                    old_manifest=manifests[old_idx],
+                    new_manifest=manifests[new_idx],
+                )
+                if delta_pdf:
+                    st.success(f"Delta PDF created: {delta_pdf}")
+                    try:
+                        with open(delta_pdf, "rb") as f:
+                            st.download_button(
+                                "Download delta PDF",
+                                data=f,
+                                file_name=delta_pdf.name,
+                                mime="application/pdf",
+                                key="checker_download",
+                            )
+                    except Exception:
+                        pass
+                else:
+                    st.info(
+                        "No new ticker-related commentary found between these two runs. "
+                        "Everything appears to be the same."
+                    )
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+        # ---------- AI Insights: Buy / Hold / Sell ----------
+    st.markdown("<div class='cc-card'>", unsafe_allow_html=True)
+    st.markdown("#### AI Insights – Buy / Hold / Sell by company", unsafe_allow_html=True)
+    st.write(
+        "Use OpenAI to classify each ticker in a compiled run as **buy**, **hold**, "
+        "**sell**, or **unclear**, with reasoning grounded in the excerpted letters."
+    )
+
+    ai_quarter = st.selectbox(
+        "Quarter for AI analysis",
+        options=quarter_options,
+        index=quarter_options.index(default_q) if default_q in quarter_options else 0,
+        key="ai_quarter",
+    )
+    ai_batch = st.selectbox(
+        "Batch for AI analysis",
+        options=batch_names,
+        index=0,
+        key="ai_batch",
+    )
+
+    ai_manifests = _load_manifests(ai_batch, ai_quarter)
+    if not ai_manifests:
+        st.info(
+            "No manifests found yet for this batch and quarter. "
+            "Run this batch at least once (full or incremental) before using AI insights."
+        )
+    else:
+        labels = [
+            f"{i+1}. {m.get('created_at', '')} – "
+            f"{Path(m.get('compiled_pdf', '')).name or '[no compiled PDF]'}"
+            for i, m in enumerate(ai_manifests)
+        ]
+        ai_manifest_idx = st.selectbox(
+            "Which run should the AI analyse?",
+            options=list(range(len(ai_manifests))),
+            format_func=lambda i: labels[i],
+            index=0,
+            key="ai_manifest_idx",
+        )
+
+        ai_model = st.text_input(
+            "OpenAI model name",
+            value="gpt-4o-mini",
+            help="Any chat-compatible model, e.g. gpt-4o or gpt-4o-mini.",
+        )
+        ai_use_web = st.checkbox(
+            "Allow OpenAI to use web search",
+            value=True,
+            help="For now this mainly controls how much external context the model "
+                 "is encouraged to bring into the `web_check` field.",
+        )
+
+        results: List[Dict[str, Any]] = []
+        if st.button("Run AI analysis for this run", key="ai_run_btn"):
+            manifest = ai_manifests[ai_manifest_idx]
+            with st.spinner("Calling OpenAI for ticker-level stances…"):
+                try:
+                    results = ai_insights.generate_ticker_stances(
+                        manifest=manifest,
+                        batch=ai_batch,
+                        quarter=ai_quarter,
+                        model=ai_model,
+                        use_web=ai_use_web,
+                    )
+                except Exception as e:
+                    st.error(f"AI analysis failed: {e}")
+                    results = []
+
+            st.session_state["ai_results"] = results
+
+        # If we already have results in session, reuse them so we can interact with dropdown
+        if "ai_results" in st.session_state and not results:
+            results = st.session_state["ai_results"]
+
+        if results:
+            # Compact summary table
+            summary_rows = []
+            for r in results:
+                summary_rows.append(
+                    {
+                        "Ticker": r.get("ticker"),
+                        "Company": ", ".join(r.get("company_names") or []),
+                        "Stance": r.get("stance"),
+                        "Confidence": round(float(r.get("confidence", 0.0)), 2),
+                    }
+                )
+            st.write("**Summary by ticker**")
+            st.dataframe(summary_rows, use_container_width=True)
+
+            # Detailed view: dropdown + gauge + reasoning
+            ticker_options = [row["Ticker"] for row in summary_rows]
+            if ticker_options:
+                focus_ticker = st.selectbox(
+                    "Detailed view – choose a ticker",
+                    options=ticker_options,
+                    key="ai_focus_ticker",
+                )
+                detail = next((r for r in results if r.get("ticker") == focus_ticker), None)
+
+                if detail:
+                    stance = (detail.get("stance") or "").lower()
+                    conf = float(detail.get("confidence") or 0.0)
+
+                    # Map stance + confidence to a 0–1 position for the gauge
+                    if stance == "buy":
+                        pos = 0.5 + 0.5 * conf
+                    elif stance == "sell":
+                        pos = 0.5 - 0.5 * conf
+                    elif stance == "hold":
+                        pos = 0.5
+                    else:  # unclear
+                        pos = 0.5
+                    pos = max(0.0, min(1.0, pos))
+                    angle = -90 + 180 * pos  # -90 (sell) .. 0 (hold) .. +90 (buy)
+
+                    gauge_html = f"""
+                    <div class="gauge-wrapper">
+                      <div class="gauge">
+                        <div class="gauge-body">
+                          <div class="gauge-needle" style="transform: rotate({angle:.1f}deg);"></div>
+                          <div class="gauge-cover">{stance.upper() if stance else "UNCLEAR"}</div>
+                        </div>
+                      </div>
+                      <div style="display:flex;justify-content:space-between;font-size:0.75rem;color:#6b4f7a;margin-top:0.15rem;">
+                        <span>Sell</span><span>Hold</span><span>Buy</span>
+                      </div>
+                    </div>
+                    """
+                    st.markdown(gauge_html, unsafe_allow_html=True)
+
+                    company_label = ", ".join(detail.get("company_names") or [])
+                    st.markdown(f"**Reasoning for {focus_ticker} ({company_label})**")
+                    st.write(detail.get("primary_reasoning", ""))
+
+                    st.markdown("**Evidence from commentaries**")
+                    for ev in detail.get("commentary_evidence") or []:
+                        st.markdown(f"- {ev}")
+
+                    st.markdown("**Web check**")
+                    st.write(detail.get("web_check_summary") or "No additional web context used.")
+
+                    funds = detail.get("fund_families") or []
+                    if funds:
+                        chips = "".join(
+                            f"<span class='fund-chip'>{f}</span>" for f in funds
+                        )
+                        st.markdown("**Fund sources used in this decision:**", unsafe_allow_html=True)
+                        st.markdown(chips, unsafe_allow_html=True)
+        else:
+            st.info(
+                "Run the AI analysis above to see ticker stances, then select a ticker "
+                "for a detailed gauge view."
+            )
+
+    st.markdown("</div>", unsafe_allow_html=True)
 
     # Output path
     st.markdown("<div class='cc-card'>", unsafe_allow_html=True)
