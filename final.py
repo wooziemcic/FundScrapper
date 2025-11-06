@@ -1347,6 +1347,12 @@ def main():
     st.markdown(
         """
         <style>
+        /* Center all images (logo) */
+        .stImage img {
+            display: block;
+            margin-left: calc(100% - 20px);  /* pushes it ~20px to the right */
+            transform: translateX(-50%);
+        }
         /* Overall background and font tweaks */
         .stApp {
             background: radial-gradient(circle at top left, #f5f0fb 0, #ffffff 40%, #f7f3fb 100%);
@@ -1360,7 +1366,7 @@ def main():
             color: #4b2142;
             font-size: 1.9rem;
             font-weight: 700;
-            margin-bottom: 0.1rem;
+            margin-bottom: 0.3rem;
         }
         .app-subtitle {
             text-align: center;
@@ -1506,16 +1512,20 @@ def main():
     )
 
     # Header: centered logo and text
+        # Header: logo + title in a centered column
     logo_path = HERE / "cutler.png"
     col_left, col_center, col_right = st.columns([1, 2, 1])
+
     with col_center:
         if logo_path.exists():
             st.image(str(logo_path), width=260)
+
         st.markdown("<div class='app-title'>Cutler Capital Letter Scraper</div>", unsafe_allow_html=True)
         st.markdown(
             "<div class='app-subtitle'>Scrape, excerpt, and compile fund letters by fund family and quarter.</div>",
             unsafe_allow_html=True,
         )
+
 
     # Sidebar: run settings
     st.sidebar.header("Run settings")

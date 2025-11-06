@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Tuple
 from dotenv import load_dotenv
 import openai
+import importlib.util
 
 HERE = Path(__file__).resolve().parent
 
