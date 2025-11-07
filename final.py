@@ -46,7 +46,7 @@ except Exception:
 from pypdf import PdfReader as _PdfReader, PdfWriter as _PdfWriter
 from reportlab.pdfgen import canvas
 from reportlab.lib import colors
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 # local imports
 import importlib.util
@@ -583,14 +583,48 @@ def _set_quarter(page, wanted: str) -> bool:
     page.wait_for_timeout(250)
     return True
 
-def _search_by_fund(page, keyword: str) -> None:
-    inp = page.locator(FILTERS["fund"]).first
-    inp.fill(""); inp.type(keyword, delay=10)
-    page.locator(FILTERS["search_btn"]).first.click(force=True)
-    try:
-        page.wait_for_load_state("networkidle", timeout=8000)
-    except Exception:
-        page.locator(TABLE_ROW).first.wait_for(state="visible", timeout=8000)
+def _search_by_fund(page, keyword: str, retries: int = 2) -> None:
+    """
+    Type a fund keyword into the BSD fund search box and trigger the search.
+
+    More robust than the original version:
+    - Waits explicitly for the search input to be visible.
+    - Uses longer timeouts.
+    - Retries a couple of times on timeout (with reload) before giving up.
+    """
+    for attempt in range(retries + 1):
+        try:
+            # Wait for the search input to actually be there
+            inp = page.locator(FILTERS["fund"]).first
+            inp.wait_for(state="visible", timeout=20000)
+
+            # Clear and type the keyword
+            inp.fill("")
+            inp.type(keyword, delay=10)
+
+            # Click search
+            page.locator(FILTERS["search_btn"]).first.click(force=True)
+
+            # Wait for either network idle or at least one row to show
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except PlaywrightTimeoutError:
+                page.locator(TABLE_ROW).first.wait_for(
+                    state="visible",
+                    timeout=15000,
+                )
+
+            # If we got here without exceptions, search was successful
+            return
+
+        except PlaywrightTimeoutError:
+            # If we still have retries left, reload and try again
+            if attempt < retries:
+                page.reload()
+                page.wait_for_load_state("domcontentloaded", timeout=20000)
+                continue
+            # Out of retries: re-raise so caller logs the error for this fund only
+            raise
 
 def _parse_rows(page, quarter: str) -> List[Hit]:
     rows = page.locator(TABLE_ROW)
@@ -942,7 +976,7 @@ def get_available_quarters() -> List[str]:
             browser = pw.chromium.launch(headless=True)
             ctx = browser.new_context()
             page = ctx.new_page()
-            page.set_default_timeout(15000)
+            page.set_default_timeout(30000)
             page.goto(BSD_URL)
 
             sel = page.locator(FILTERS["quarter"]).first
@@ -1058,7 +1092,7 @@ def run_batch(batch_name: str, quarters: List[str], use_first_word: bool, subset
         browser = pw.chromium.launch(headless=True)
         ctx = browser.new_context(accept_downloads=True)
         page = ctx.new_page()
-        page.set_default_timeout(15000)
+        page.set_default_timeout(30000)
         page.goto(BSD_URL)
 
         for q in quarters:
@@ -1210,7 +1244,7 @@ def run_incremental_update(batch_name: str, quarter: str, use_first_word: bool):
         browser = pw.chromium.launch(headless=True)
         ctx = browser.new_context(accept_downloads=True)
         page = ctx.new_page()
-        page.set_default_timeout(15000)
+        page.set_default_timeout(30000)
         page.goto(BSD_URL)
 
         st.write(f"Scanning BSD table for {batch_name} / {quarter} (no downloads yet)…")
