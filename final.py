@@ -16,11 +16,13 @@ if platform.system() == "Windows":
         pass
 
 import re
+import os
 import sys
 import shutil
 import traceback
 import json
 import hashlib
+import openai
 from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
@@ -47,6 +49,8 @@ from pypdf import PdfReader as _PdfReader, PdfWriter as _PdfWriter
 from reportlab.pdfgen import canvas
 from reportlab.lib import colors
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+import sa_news_ai as sa_news
+import seekingalpha_excerpts as sa_scraper
 
 # local imports
 import importlib.util
@@ -63,6 +67,19 @@ def _import(name: str, path: Path):
 
 excerpt_check = _import("excerpt_check", HERE / "excerpt_check.py")
 make_pdf = _import("make_pdf", HERE / "make_pdf.py")
+
+# Seeking Alpha news + AI digest
+try:
+    sa_news_ai = _import("sa_news_ai", HERE / "sa_news_ai.py")
+except Exception:
+    sa_news_ai = None  # SA integration is optional
+
+# Ticker dictionary (we reuse for the SA dropdown)
+try:
+    tickers_mod = _import("tickers", HERE / "tickers.py")
+except Exception:
+    tickers_mod = None
+
 
 # paths (still stored under BSD/ on disk; UI is Cutler-branded only)
 BASE = HERE / "BSD"
@@ -343,7 +360,6 @@ GQG Partners
 Gator Capital
 Geneva
 Glenmede
-Global X
 GoodHaven
 Grayscale
 GuideStone
@@ -530,6 +546,30 @@ def _parse_big_list(raw: str) -> List[str]:
         if key and key not in seen:
             seen.add(key); out.append(name)
     return out
+
+def _get_all_known_tickers() -> list[str]:
+    """Try to infer a ticker list from tickers.py; fall back to a few majors."""
+    if tickers_mod is None:
+        return ["TSLA", "AAPL", "NVDA"]
+
+    candidates: set[str] = set()
+
+    for name in dir(tickers_mod):
+        val = getattr(tickers_mod, name)
+        if isinstance(val, dict):
+            # keys are often tickers in Vikrant-land
+            for k in val.keys():
+                candidates.add(str(k).upper())
+        elif isinstance(val, (list, tuple, set)):
+            # sometimes a flat list of tickers
+            for item in val:
+                if isinstance(item, str) and item.isalpha() and 1 <= len(item) <= 6:
+                    candidates.add(item.upper())
+
+    if not candidates:
+        return ["TSLA", "AAPL", "NVDA"]
+
+    return sorted(candidates)
 
 def _chunk_round_robin(items: List[str], k: int) -> List[List[str]]:
     buckets = [[] for _ in range(k)]
@@ -782,6 +822,281 @@ def compile_merged(batch: str, quarter: str, collected: List[Path]) -> Optional[
     finally:
         m.close()
     return out
+
+# -------------------------------------------------------------------
+# Seeking Alpha Analysis API helpers (RapidAPI)
+# -------------------------------------------------------------------
+
+SA_ANALYSIS_BASE = "https://seeking-alpha.p.rapidapi.com"
+
+
+def _get_sa_rapidapi_key() -> str:
+    key = os.getenv("SA_RAPIDAPI_KEY")
+    if not key:
+        raise RuntimeError(
+            "SA_RAPIDAPI_KEY env var is not set – add it to your .env for Seeking Alpha Analysis."
+        )
+    return key
+
+
+def fetch_sa_analysis_list(symbol: str, size: int = 10) -> list[dict]:
+    """
+    Call /analysis/v2/list for a single symbol and return a simplified list
+    of articles: id, title, published, primary_tickers, url.
+    """
+    api_key = _get_sa_rapidapi_key()
+    url = f"{SA_ANALYSIS_BASE}/analysis/v2/list"
+
+    params = {
+        "id": symbol.lower(),  # API expects lowercase id like 'tsla', 'aapl'
+        "size": str(size),
+        "number": "1",         # first "page"
+    }
+    headers = {
+        "x-rapidapi-key": api_key,
+        "x-rapidapi-host": "seeking-alpha.p.rapidapi.com",
+    }
+
+    resp = requests.get(url, headers=headers, params=params, timeout=20)
+    resp.raise_for_status()
+    payload = resp.json()
+
+    data = payload.get("data", [])
+    items: list[dict] = []
+
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        art_id = row.get("id")
+        attrs = row.get("attributes", {}) or {}
+        rel = row.get("relationships", {}) or {}
+
+        publish_on = attrs.get("publishOn")
+        title = attrs.get("title", "").strip()
+
+        # primary tickers come through as tag ids – we just keep them for debugging;
+        # you already know which symbol you asked for.
+        pt_data = ((rel.get("primaryTickers") or {}).get("data")) or []
+        primary_ids = [
+            t.get("id") for t in pt_data
+            if isinstance(t, dict) and t.get("id")
+        ]
+
+        article_url = f"https://seekingalpha.com/article/{art_id}" if art_id else ""
+
+        items.append(
+            {
+                "id": art_id,
+                "title": title,
+                "published": publish_on,
+                "primary_tickers": primary_ids,
+                "url": article_url,
+            }
+        )
+
+    return items
+
+
+def fetch_sa_analysis_body(article_id: str) -> str:
+    """
+    Call /analysis/v2/get-details for a single article and return the raw HTML body.
+    """
+    api_key = _get_sa_rapidapi_key()
+    url = f"{SA_ANALYSIS_BASE}/analysis/v2/get-details"
+
+    params = {"id": str(article_id)}
+    headers = {
+        "x-rapidapi-key": api_key,
+        "x-rapidapi-host": "seeking-alpha.p.rapidapi.com",
+    }
+
+    resp = requests.get(url, headers=headers, params=params, timeout=20)
+    resp.raise_for_status()
+    payload = resp.json()
+
+    data = payload.get("data") or []
+    if not data:
+        return ""
+
+    first = data[0]
+    attrs = first.get("attributes", {}) or {}
+
+    # In practice this field is usually called "content"
+    body_html = attrs.get("content") or ""
+    return body_html
+
+
+def build_sa_analysis_digest(
+    symbol: str,
+    articles: list[dict],
+    model: str = "gpt-4o-mini",
+    max_articles: int = 4,
+) -> str:
+    """
+    Pull bodies for top N articles and ask OpenAI to write a concise research-style digest.
+    """
+    if not articles:
+        return f"No recent Seeking Alpha analysis articles found for {symbol}."
+
+    # Take the first few articles (most recent)
+    selected = articles[:max_articles]
+
+    # Fetch bodies; if any call fails we just skip that article in the prompt
+    article_blobs: list[str] = []
+    for art in selected:
+        art_id = art.get("id")
+        title = art.get("title", "")
+        published = art.get("published", "")
+        url = art.get("url", "")
+
+        if not art_id:
+            continue
+
+        try:
+            body_html = fetch_sa_analysis_body(art_id)
+        except Exception:
+            body_html = ""
+
+        # Truncate body to keep prompt size sane
+        if body_html:
+            body_snippet = body_html[:4000]
+        else:
+            body_snippet = ""
+
+        blob = (
+            f"Title: {title}\n"
+            f"Published: {published}\n"
+            f"URL: {url}\n"
+            f"Body (HTML snippet):\n{body_snippet}\n"
+            "----\n"
+        )
+        article_blobs.append(blob)
+
+    if not article_blobs:
+        return (
+            f"Analysis metadata was found for {symbol}, but article bodies could not "
+            "be retrieved from Seeking Alpha."
+        )
+
+    joined = "\n\n".join(article_blobs)
+
+    prompt = (
+        f"You are a senior equity analyst at a value-oriented fund. "
+        f"Summarize the key views from recent Seeking Alpha *analysis* articles "
+        f"about {symbol}. Focus on:\n"
+        f"- Overall bullish/bearish stance and main thesis\n"
+        f"- Key catalysts and risks mentioned\n"
+        f"- Any disagreement or debate between authors\n"
+        f"- Anything directly relevant for a fundamental PM at a small shop like Cutler\n\n"
+        f"Write 4–7 sentences, neutral and fact-based. "
+        f"Do not invent numbers or facts – stick to the content below.\n\n"
+        f"ARTICLES:\n{joined}"
+    )
+
+    try:
+        resp = openai.ChatCompletion.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You write concise internal research digests for portfolio managers.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3,
+            max_tokens=600,
+        )
+        return resp["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        return f"(Error while calling OpenAI for digest: {e})"
+
+def draw_seeking_alpha_news_section():
+    import pandas as pd
+
+    st.markdown("### Seeking Alpha – Analysis digest by ticker")
+
+    # Ticker selector (reuse your Cutler universe if present)
+    try:
+        from tickers import tickers as CUTLER_TICKERS
+        UNIVERSE = sorted(list(CUTLER_TICKERS.keys()))
+    except Exception:
+        UNIVERSE = []
+
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        ticker = st.selectbox(
+            "Ticker",
+            UNIVERSE or ["TSLA", "AAPL", "MSFT"],
+            index=0,
+        )
+    with col2:
+        lookback_days = st.slider(
+            "Max articles to pull",
+            min_value=3,
+            max_value=20,
+            value=10,
+            help="How many recent analysis pieces from Seeking Alpha to use.",
+        )
+
+    model = st.selectbox(
+        "OpenAI model for digest",
+        ["gpt-4o-mini", "gpt-4o"],
+        index=0,
+    )
+
+    if st.button("Fetch Seeking Alpha *analysis* & build AI digest"):
+        if not ticker:
+            st.warning("Please choose a ticker first.")
+            return
+
+        try:
+            with st.spinner(
+                f"Pulling Seeking Alpha analysis for {ticker} via RapidAPI..."
+            ):
+                articles = fetch_sa_analysis_list(ticker, size=lookback_days)
+        except Exception as e:
+            st.error(f"Error while fetching Seeking Alpha analysis: {e}")
+            return
+
+        if not articles:
+            st.info(f"No Seeking Alpha analysis articles returned for {ticker}.")
+            return
+
+        # ---------------------------------------------------------------
+        # Show table of articles
+        # ---------------------------------------------------------------
+        rows = []
+        for art in articles:
+            published_str = art.get("published") or ""
+            # Trim to date part if ISO timestamp
+            if "T" in published_str:
+                published_str = published_str.split("T", 1)[0]
+
+            rows.append(
+                {
+                    "Date": published_str,
+                    "Title": art.get("title", ""),
+                    "Source": "Seeking Alpha (Analysis)",
+                    "URL": art.get("url", ""),
+                }
+            )
+
+        df = pd.DataFrame(rows)
+        st.markdown("#### Recent Seeking Alpha analysis articles")
+        st.dataframe(df, use_container_width=True)
+
+        # ---------------------------------------------------------------
+        # Build and show AI digest
+        # ---------------------------------------------------------------
+        with st.spinner("Asking OpenAI for a short analysis digest..."):
+            digest_text = build_sa_analysis_digest(
+                symbol=ticker,
+                articles=articles,
+                model=model,
+            )
+
+        st.markdown("#### AI Analysis Digest")
+        st.write(digest_text)
 
 # ---------- Manifest + Delta helpers ----------
 
@@ -1896,6 +2211,10 @@ def main():
             )
 
     st.markdown("</div>", unsafe_allow_html=True)
+
+    # ---------- Seeking Alpha news + AI digest ----------
+    draw_seeking_alpha_news_section()
+
 
     # Output path
     st.markdown("<div class='cc-card'>", unsafe_allow_html=True)
