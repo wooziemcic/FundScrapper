@@ -28,9 +28,11 @@ from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Any
-
+import re as _re
+import html as html_lib
 import streamlit as st
 import requests
+import sa_analysis_api as sa_api 
 
 # pypdf compat
 try:
@@ -79,6 +81,15 @@ try:
     tickers_mod = _import("tickers", HERE / "tickers.py")
 except Exception:
     tickers_mod = None
+
+from sa_analysis_api import (
+    fetch_analysis_list,
+    fetch_article_details,
+    build_sa_analysis_digest,
+    analyse_symbol_with_digest,
+    AnalysisArticle,
+    fetch_analysis_details,
+)
 
 
 # paths (still stored under BSD/ on disk; UI is Cutler-branded only)
@@ -838,6 +849,100 @@ def _get_sa_rapidapi_key() -> str:
         )
     return key
 
+# sa_analysis_api.py
+
+import os
+import requests
+from dataclasses import dataclass
+from typing import List, Dict, Any, Optional
+
+SA_RAPIDAPI_KEY = os.environ.get("SA_RAPIDAPI_KEY")
+if not SA_RAPIDAPI_KEY:
+    raise SystemExit("SA_RAPIDAPI_KEY env var is not set")
+
+BASE_URL = "https://seeking-alpha.p.rapidapi.com"
+
+HEADERS = {
+    "x-rapidapi-key": SA_RAPIDAPI_KEY,
+    "x-rapidapi-host": "seeking-alpha.p.rapidapi.com",
+}
+
+@dataclass
+class AnalysisArticle:
+    id: str
+    title: str
+    published: str
+    url: str
+    # you already have these fields in your version, keep them if present
+    # summary_html: Optional[str] = None
+    # body_html: Optional[str] = None
+
+
+def _call_sa(endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    url = BASE_URL + endpoint
+    resp = requests.get(url, headers=HEADERS, params=params, timeout=20)
+    resp.raise_for_status()
+    return resp.json()
+    
+
+def fetch_analysis_list(symbol: str, size: int = 5) -> List[AnalysisArticle]:
+    """
+    GET /analysis/v2/list?id={symbol}&size={size}&number=1
+    """
+    payload = _call_sa("/analysis/v2/list", {"id": symbol.lower(), "size": size, "number": 1})
+
+    items = payload.get("data", [])
+    out: List[AnalysisArticle] = []
+
+    for item in items:
+        attrs = item.get("attributes", {})
+        art_id = str(item.get("id"))
+        title = attrs.get("title", "")
+        published = attrs.get("publishOn", "")
+        link = "https://seekingalpha.com" + item.get("links", {}).get("self", "")
+
+        out.append(AnalysisArticle(
+            id=art_id,
+            title=title,
+            published=published,
+            url=link,
+        ))
+
+    return out
+
+
+def fetch_analysis_details(article_id: str) -> Dict[str, Any]:
+    """
+    GET /analysis/v2/get-details?id={article_id}
+    Returns a dict with title, body_html, summary_html and image_url.
+    """
+    payload = _call_sa("/analysis/v2/get-details", {"id": article_id})
+
+    try:
+        main = payload["data"][0]
+        attrs = main.get("attributes", {})
+    except Exception:
+        return {}
+
+    # Different fields exist depending on endpoint version; cover both
+    body_html = (
+        attrs.get("bodyHtml")    # camelCase
+        or attrs.get("body_html")
+        or ""
+    )
+    summary_html = (
+        attrs.get("summaryHtml")
+        or attrs.get("summary_html")
+        or ""
+    )
+    image_url = attrs.get("gettyImageUrl") or ""
+
+    return {
+        "title": attrs.get("title", ""),
+        "body_html": body_html,
+        "summary_html": summary_html,
+        "image_url": image_url,
+    }
 
 def fetch_sa_analysis_list(symbol: str, size: int = 10) -> list[dict]:
     """
@@ -925,117 +1030,213 @@ def fetch_sa_analysis_body(article_id: str) -> str:
     body_html = attrs.get("content") or ""
     return body_html
 
+def clean_sa_html(html: str, max_len: Optional[int] = None) -> str:
+    """
+    Convert Seeking Alpha article HTML into clean, readable plain text.
+
+    - Turns block tags (p/div/br/li/h1–h6) into paragraph breaks.
+    - Strips all other tags.
+    - Normalises whitespace but *keeps* paragraph breaks.
+    - Inserts spaces between digits and letters to fix things like
+      '13Bofcash' -> '13B of cash'.
+    - If max_len is given, truncates on a word boundary.
+    """
+    import re
+    import html as html_lib
+
+    if not html:
+        return ""
+
+    # Decode HTML entities (&amp;, &nbsp;, etc.)
+    text = html_lib.unescape(html)
+
+    # 1) Turn common block / line-break tags into newlines
+    text = re.sub(
+        r"(?i)<\s*(br\s*/?|/p|p|/div|div|li|/li|h[1-6]|/h[1-6])[^>]*>",
+        "\n",
+        text,
+    )
+
+    # 2) Remove any remaining tags
+    text = re.sub(r"<[^>]+>", " ", text)
+
+    # 3) Normalise whitespace but keep newlines-as-paragraphs
+    text = text.replace("\r", "")
+    lines = []
+    for ln in text.split("\n"):
+        # collapse spaces/tabs on each line
+        ln = re.sub(r"[ \t]+", " ", ln).strip()
+        if ln:
+            lines.append(ln)
+    # rebuild paragraphs with a blank line between them
+    text = "\n\n".join(lines)
+
+    # 4) Fix digit/letter run-ons: 15.7Billion -> 15.7 Billion, EPS1.86 -> EPS 1.86
+    text = re.sub(r"(\d)([A-Za-z])", r"\1 \2", text)
+    text = re.sub(r"([A-Za-z])(\d)", r"\1 \2", text)
+
+    # 5) Optional truncation for model input
+    if max_len and len(text) > max_len:
+        cut = text[:max_len]
+        cut = cut.rsplit(" ", 1)[0]  # don’t cut in the middle of a word
+        text = cut + " ..."
+
+    return text
+
+def _art_attr(art: Any, name: str, default: Any = "") -> Any:
+    """Handle both dicts and AnalysisArticle objects."""
+    if isinstance(art, dict):
+        return art.get(name, default)
+    return getattr(art, name, default)
 
 def build_sa_analysis_digest(
     symbol: str,
-    articles: list[dict],
+    articles,
     model: str = "gpt-4o-mini",
-    max_articles: int = 4,
+    max_chars: int | None = None,
 ) -> str:
     """
-    Pull bodies for top N articles and ask OpenAI to write a concise research-style digest.
+    Build a short bullet-point digest from a list of AnalysisArticle objects.
+
+    `articles` is the list returned by sa_analysis_api.fetch_analysis_list.
+    We use only lightweight metadata (date, title, url).
     """
     if not articles:
         return f"No recent Seeking Alpha analysis articles found for {symbol}."
 
-    # Take the first few articles (most recent)
-    selected = articles[:max_articles]
-
-    # Fetch bodies; if any call fails we just skip that article in the prompt
-    article_blobs: list[str] = []
-    for art in selected:
-        art_id = art.get("id")
-        title = art.get("title", "")
-        published = art.get("published", "")
-        url = art.get("url", "")
-
-        if not art_id:
+    # Build a compact text summary of the articles we have.
+    lines = []
+    for art in articles:
+        try:
+            date_str = art.published.split("T", 1)[0] if art.published else ""
+            title = art.title or ""
+            url = art.url or ""
+            lines.append(f"- {date_str} — {title} ({url})")
+        except Exception:
             continue
 
-        try:
-            body_html = fetch_sa_analysis_body(art_id)
-        except Exception:
-            body_html = ""
+    context_block = "\n".join(lines)
 
-        # Truncate body to keep prompt size sane
-        if body_html:
-            body_snippet = body_html[:4000]
-        else:
-            body_snippet = ""
+    system_msg = (
+        "You are helping a fundamental portfolio manager at a small buy-side shop.\n"
+        "You will receive a list of recent Seeking Alpha ANALYSIS articles for one ticker.\n"
+        "Write a concise bullet-point digest (4–7 bullets max) capturing:\n"
+        "- Overall stance (bullish / bearish / mixed) across authors\n"
+        "- Key fundamental drivers mentioned (earnings, pipeline, margins, cash flow, etc.)\n"
+        "- Any repeated risks or points of disagreement\n"
+        "- Any notable technical or sentiment comments\n"
+        "Keep language plain, professional, and focused on what a PM should know."
+    )
 
-        blob = (
-            f"Title: {title}\n"
-            f"Published: {published}\n"
-            f"URL: {url}\n"
-            f"Body (HTML snippet):\n{body_snippet}\n"
-            "----\n"
-        )
-        article_blobs.append(blob)
-
-    if not article_blobs:
-        return (
-            f"Analysis metadata was found for {symbol}, but article bodies could not "
-            "be retrieved from Seeking Alpha."
-        )
-
-    joined = "\n\n".join(article_blobs)
-
-    prompt = (
-        f"You are a senior equity analyst at a value-oriented fund. "
-        f"Summarize the key views from recent Seeking Alpha *analysis* articles "
-        f"about {symbol}. Focus on:\n"
-        f"- Overall bullish/bearish stance and main thesis\n"
-        f"- Key catalysts and risks mentioned\n"
-        f"- Any disagreement or debate between authors\n"
-        f"- Anything directly relevant for a fundamental PM at a small shop like Cutler\n\n"
-        f"Write 4–7 sentences, neutral and fact-based. "
-        f"Do not invent numbers or facts – stick to the content below.\n\n"
-        f"ARTICLES:\n{joined}"
+    user_msg = (
+        f"TICKER: {symbol}\n\n"
+        "Recent Seeking Alpha analysis articles:\n"
+        f"{context_block}\n\n"
+        "Now write the digest."
     )
 
     try:
         resp = openai.ChatCompletion.create(
             model=model,
             messages=[
-                {
-                    "role": "system",
-                    "content": "You write concise internal research digests for portfolio managers.",
-                },
-                {"role": "user", "content": prompt},
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
             ],
             temperature=0.3,
             max_tokens=600,
         )
-        return resp["choices"][0]["message"]["content"].strip()
+        digest = resp["choices"][0]["message"]["content"].strip()
+        return digest
     except Exception as e:
-        return f"(Error while calling OpenAI for digest: {e})"
+        return f"Error while calling OpenAI: {e}"
 
-def draw_seeking_alpha_news_section():
+def clean_html_to_text(html: str) -> str:
+    if not html:
+        return ""
+    # Remove HTML tags
+    text = re.sub(r"<[^>]+>", " ", html)
+    # Convert multiple spaces/newlines
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+def clean_sa_html_to_markdown(raw_html: str) -> str:
+    """
+    Convert Seeking Alpha article HTML into clean, readable text for Streamlit.
+
+    - Converts block tags to paragraph breaks.
+    - Strips all other tags.
+    - Normalises whitespace but keeps paragraph breaks.
+    - Fixes digit/letter run-ons like '13Bofcash' -> '13B of cash'.
+    """
+    import re
+    import html as html_lib
+
+    if not raw_html:
+        return ""
+
+    # Decode entities (&amp;, &nbsp;, etc.)
+    text = html_lib.unescape(raw_html)
+
+    # Turn common block / break tags into newlines
+    text = re.sub(
+        r"(?i)<\s*(br\s*/?|/p|p|/div|div|/li|li|h[1-6]|/h[1-6])[^>]*>",
+        "\n",
+        text,
+    )
+
+    # Remove remaining tags, leaving a space so words don't glue together
+    text = re.sub(r"<[^>]+>", " ", text)
+
+    # Normalise whitespace but keep paragraph structure
+    text = text.replace("\r", "")
+    lines = []
+    for ln in text.split("\n"):
+        ln = re.sub(r"[ \t]+", " ", ln).strip()
+        if ln:
+            lines.append(ln)
+    text = "\n\n".join(lines)
+
+    # Fix digit/letter run-ons
+    text = re.sub(r"(\d)([A-Za-z])", r"\1 \2", text)
+    text = re.sub(r"([A-Za-z])(\d)", r"\1 \2", text)
+
+    return text.strip()
+
+def draw_seeking_alpha_news_section() -> None:
+    """
+    Seeking Alpha – Analysis digest by ticker.
+
+    Uses:
+      - sa_analysis_api.fetch_analysis_list
+      - sa_analysis_api.fetch_analysis_details
+      - sa_analysis_api.build_sa_analysis_digest (which calls OpenAI)
+    """
     import pandas as pd
+    import streamlit as st
 
     st.markdown("### Seeking Alpha – Analysis digest by ticker")
 
-    # Ticker selector (reuse your Cutler universe if present)
+    # ---------- Ticker + controls ----------
     try:
         from tickers import tickers as CUTLER_TICKERS
-        UNIVERSE = sorted(list(CUTLER_TICKERS.keys()))
+        universe = sorted(list(CUTLER_TICKERS.keys()))
     except Exception:
-        UNIVERSE = []
+        universe = []
 
     col1, col2 = st.columns([2, 1])
     with col1:
         ticker = st.selectbox(
             "Ticker",
-            UNIVERSE or ["TSLA", "AAPL", "MSFT"],
+            universe or ["TSLA", "AAPL", "MSFT"],
             index=0,
         )
     with col2:
-        lookback_days = st.slider(
-            "Max articles to pull",
+        max_articles = st.slider(
+            "Max analysis pieces to pull",
             min_value=3,
-            max_value=20,
-            value=10,
-            help="How many recent analysis pieces from Seeking Alpha to use.",
+            max_value=10,
+            value=5,
+            help="How many recent Seeking Alpha *analysis* articles to use.",
         )
 
     model = st.selectbox(
@@ -1044,59 +1245,162 @@ def draw_seeking_alpha_news_section():
         index=0,
     )
 
-    if st.button("Fetch Seeking Alpha *analysis* & build AI digest"):
-        if not ticker:
-            st.warning("Please choose a ticker first.")
-            return
+    if not st.button("Fetch Seeking Alpha analysis & build AI digest"):
+        return
 
-        try:
-            with st.spinner(
-                f"Pulling Seeking Alpha analysis for {ticker} via RapidAPI..."
-            ):
-                articles = fetch_sa_analysis_list(ticker, size=lookback_days)
-        except Exception as e:
-            st.error(f"Error while fetching Seeking Alpha analysis: {e}")
-            return
+    if not ticker:
+        st.warning("Please choose a ticker first.")
+        return
 
-        if not articles:
-            st.info(f"No Seeking Alpha analysis articles returned for {ticker}.")
-            return
+    # ---------- 1) Fetch list of analysis articles ----------
+    try:
+        with st.spinner(f"Pulling Seeking Alpha analysis for {ticker} via RapidAPI..."):
+            articles = sa_api.fetch_analysis_list(ticker, size=max_articles)
+    except Exception as e:
+        st.error(f"Error while fetching Seeking Alpha analysis: {e}")
+        return
 
-        # ---------------------------------------------------------------
-        # Show table of articles
-        # ---------------------------------------------------------------
-        rows = []
-        for art in articles:
-            published_str = art.get("published") or ""
-            # Trim to date part if ISO timestamp
-            if "T" in published_str:
-                published_str = published_str.split("T", 1)[0]
+    if not articles:
+        st.info(f"No Seeking Alpha analysis articles returned for {ticker}.")
+        return
 
-            rows.append(
-                {
-                    "Date": published_str,
-                    "Title": art.get("title", ""),
-                    "Source": "Seeking Alpha (Analysis)",
-                    "URL": art.get("url", ""),
-                }
-            )
+    # ---------- 2) Show table of articles ----------
+    rows = []
+    for art in articles:
+        date_str = art.published.split("T", 1)[0] if getattr(art, "published", "") else ""
+        rows.append(
+            {
+                "Date": date_str,
+                "Title": getattr(art, "title", ""),
+                "Source": "Seeking Alpha (Analysis)",
+                "URL": getattr(art, "url", ""),
+            }
+        )
 
-        df = pd.DataFrame(rows)
-        st.markdown("#### Recent Seeking Alpha analysis articles")
-        st.dataframe(df, use_container_width=True)
+    df = pd.DataFrame(rows)
+    st.markdown("#### Recent Seeking Alpha analysis articles")
+    st.dataframe(df, use_container_width=True)
 
-        # ---------------------------------------------------------------
-        # Build and show AI digest
-        # ---------------------------------------------------------------
+    # ---------- 3) AI digest (delegates to sa_analysis_api) ----------
+    st.markdown("#### AI Analysis Digest")
+    try:
         with st.spinner("Asking OpenAI for a short analysis digest..."):
-            digest_text = build_sa_analysis_digest(
+            # IMPORTANT: use the implementation from sa_analysis_api.py
+            digest_text = sa_api.build_sa_analysis_digest(
                 symbol=ticker,
                 articles=articles,
                 model=model,
             )
+        st.markdown(digest_text)
+    except Exception as e:
+        st.error(f"Error while calling OpenAI: {e}")
 
-        st.markdown("#### AI Analysis Digest")
-        st.write(digest_text)
+        # -----------------------------------------------------------
+    # 4) Pull and display full article bodies (cleaned)
+    # -----------------------------------------------------------
+    st.markdown("#### Article bodies (full, cleaned)")
+
+    # Helper: normalise any HTML-ish field to a single string
+    def _normalize_html(part) -> str:
+        if part is None:
+            return ""
+        if isinstance(part, list):
+            return "\n".join(str(x) for x in part if x is not None)
+        return str(part)
+
+    # Only fetch bodies for a few articles to avoid hammering the API
+    articles_for_bodies = articles[:5]
+
+    for art in articles_for_bodies:
+        art_id = art.id
+        title = art.title or "Untitled article"
+
+        with st.expander(title):
+            st.caption("Full article (cleaned)")
+
+            try:
+                # This returns a *flat* dict:
+                # {title, summary_html, body_html, images, url}
+                details = sa_api.fetch_analysis_details(str(art_id))
+            except Exception as e:
+                st.write(f"Could not fetch article body: {e}")
+                continue
+
+            if not isinstance(details, dict) or not details:
+                st.write("No article body text returned.")
+                continue
+
+            # In case you ever switch back to raw API JSON, support both shapes:
+            if "data" in details:
+                # raw RapidAPI payload
+                data = details.get("data") or {}
+                attrs = data.get("attributes") or {}
+                summary_html = attrs.get("summary_html") or attrs.get("summary") or ""
+                body_html = (
+                    attrs.get("body_html")
+                    or attrs.get("content")
+                    or attrs.get("body")
+                    or ""
+                )
+                images = attrs.get("images") or []
+            else:
+                # current helper output from sa_analysis_api.fetch_analysis_details
+                summary_html = details.get("summary_html") or details.get("summary") or ""
+                body_html = (
+                    details.get("body_html")
+                    or details.get("content")
+                    or details.get("body")
+                    or ""
+                )
+                images = details.get("images") or []
+
+            # -------- Image (if present) --------
+            image_url = None
+            if isinstance(images, list):
+                for img in images:
+                    if not isinstance(img, dict):
+                        continue
+                    image_url = (
+                        img.get("url")
+                        or img.get("imageUrl")
+                        or img.get("src")
+                    )
+                    if image_url:
+                        break
+
+            if not image_url:
+                # Fallback if API ever sends a direct field
+                image_url = details.get("gettyImageUrl") or details.get("imageUrl")
+
+            if image_url:
+                try:
+                    st.image(image_url, use_column_width=True)
+                except Exception:
+                    # If Streamlit can't load it, just skip the image
+                    pass
+
+            # -------- Clean and render text --------
+            combined_html = (
+                _normalize_html(summary_html)
+                + "\n\n"
+                + _normalize_html(body_html)
+            )
+
+            if not combined_html.strip():
+                st.write("No article body text returned.")
+                continue
+
+            try:
+                cleaned_text = clean_sa_html_to_markdown(combined_html)
+            except NameError:
+                # Very simple fallback if helper is missing
+                import re as _re
+                tmp = _re.sub(r"<(br|p|div|li)[^>]*>", "\n", combined_html, flags=_re.I)
+                tmp = _re.sub(r"<[^>]+>", "", tmp)
+                tmp = tmp.replace("\xa0", " ")
+                cleaned_text = _re.sub(r"\n{3,}", "\n\n", tmp).strip()
+
+            st.write(cleaned_text)
 
 # ---------- Manifest + Delta helpers ----------
 

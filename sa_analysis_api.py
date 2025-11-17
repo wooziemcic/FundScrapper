@@ -279,6 +279,41 @@ def analyse_symbol_with_digest(
     digest = build_sa_analysis_digest(symbol, articles, model=model)
     return articles, digest
 
+def fetch_analysis_details(article_id: str) -> dict:
+    """
+    Fetch full Seeking Alpha article details (HTML body, title, summary, images).
+    Returns dict or {} on failure.
+    """
+    url = "https://seeking-alpha.p.rapidapi.com/analysis/v2/get-details"
+    headers = {
+        "x-rapidapi-key": RAPIDAPI_KEY,
+        "x-rapidapi-host": "seeking-alpha.p.rapidapi.com",
+    }
+    params = {"id": str(article_id)}
+
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if not isinstance(data, dict):
+            return {}
+
+        # Extract content
+        attributes = data.get("data", {}).get("attributes", {})
+
+        return {
+            "title": attributes.get("title", ""),
+            "summary_html": attributes.get("summary", ""),
+            "body_html": attributes.get("content", ""),
+            "images": attributes.get("images", []),
+            "url": f"https://seekingalpha.com/article/{article_id}"
+        }
+
+    except Exception as e:
+        print("fetch_analysis_details ERROR:", e)
+        return {}
+
 
 # -------------------------------------------------------------------
 #  Simple CLI test
