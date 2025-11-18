@@ -742,30 +742,71 @@ def draw_seeking_alpha_news_section() -> None:
     import pandas as pd
     import streamlit as st
 
+    # Simple in-session cache for SA results: {cache_key: {"articles": ..., "digest_text": ...}}
+    if "sa_cache" not in st.session_state:
+        st.session_state["sa_cache"] = {}
+
     st.markdown("### Seeking Alpha – Analysis digest by ticker")
 
-    # ---------- Ticker + controls ----------
+    # ---------- Ticker selection: up to 10, show one at a time ----------
     try:
         from tickers import tickers as CUTLER_TICKERS
         universe = sorted(list(CUTLER_TICKERS.keys()))
     except Exception:
         universe = []
 
-    col1, col2 = st.columns([2, 1])
-    with col1:
+    default_universe = ["AMZN", "AAPL", "MSFT", "GOOGL", "META", "TSLA", "JPM", "V", "MA", "BRK.B"]
+
+    # Multiselect behaves like a dropdown that can hold up to 10 names
+    selected_tickers = st.multiselect(
+        "Select up to 10 tickers for Seeking Alpha",
+        options=universe or default_universe,
+        default=(universe[:3] if universe else default_universe[:3]),
+        help="Choose a small set of names you want to quickly flip through.",
+        max_selections=10 if hasattr(st.multiselect, "__call__") else None,  # Streamlit ignores unknown args, so safe
+    )
+
+    # Enforce max 10 tickers manually in case Streamlit version does not support max_selections
+    if len(selected_tickers) > 10:
+        st.warning("Please select at most 10 tickers. Only the first 10 will be used.")
+        selected_tickers = selected_tickers[:10]
+
+    # Track navigation index in session_state
+    if "sa_selected_tickers_prev" not in st.session_state:
+        st.session_state["sa_selected_tickers_prev"] = []
+    if "sa_current_index" not in st.session_state:
+        st.session_state["sa_current_index"] = 0
+
+    # If the selection changed since last run, reset index to 0
+    if st.session_state["sa_selected_tickers_prev"] != selected_tickers:
+        st.session_state["sa_current_index"] = 0
+    st.session_state["sa_selected_tickers_prev"] = selected_tickers
+
+    if selected_tickers:
+        idx = st.session_state["sa_current_index"]
+        # Safety: clamp index if list shrank
+        if idx >= len(selected_tickers):
+            idx = 0
+            st.session_state["sa_current_index"] = 0
+        ticker = selected_tickers[idx]
+        st.markdown(f"**Currently viewing:** `{ticker}`")
+    else:
+        # Fallback: single-ticker dropdown if nothing selected
         ticker = st.selectbox(
             "Ticker",
-            universe or ["TSLA", "AAPL", "MSFT"],
+            universe or default_universe,
             index=0,
         )
-    with col2:
-        max_articles = st.slider(
-            "Max analysis pieces to pull",
-            min_value=3,
-            max_value=10,
-            value=5,
-            help="How many recent Seeking Alpha *analysis* articles to use.",
-        )
+        st.info("No watchlist selected above. Using single-ticker mode.")
+
+    # Control how many recent articles to use
+    max_articles = st.slider(
+        "Number of recent analysis articles to use",
+        min_value=3,
+        max_value=10,
+        value=5,
+        help="How many recent Seeking Alpha *analysis* articles to use.",
+    )
 
     model = st.selectbox(
         "OpenAI model for digest",
@@ -773,23 +814,72 @@ def draw_seeking_alpha_news_section() -> None:
         index=0,
     )
 
-    if not st.button("Fetch Seeking Alpha analysis & build AI digest"):
+    sa_cache = st.session_state["sa_cache"]
+    cache_key = f"{ticker}|{max_articles}|{model}"
+
+    # Button now means "fetch / refresh"; cached results will show even if you don't click again
+    fetch_clicked = st.button("Fetch / refresh Seeking Alpha analysis & build AI digest")
+
+    articles = None
+    digest_text = None
+
+    # Case 1: we have cached data for this combo and user did NOT click refresh
+    if cache_key in sa_cache and not fetch_clicked:
+        cached = sa_cache[cache_key]
+        articles = cached.get("articles")
+        digest_text = cached.get("digest_text")
+        if articles:
+            st.info(f"Showing cached Seeking Alpha analysis for `{ticker}` (model: {model}).")
+        else:
+            st.info("Cached entry exists but no articles stored; please refresh.")
+    # Case 2: user explicitly clicked button → fetch fresh data and overwrite cache
+    elif fetch_clicked:
+        if not ticker:
+            st.warning("Please choose a ticker first.")
+            return
+
+        # ---------- 1) Fetch list of analysis articles ----------
+        try:
+            with st.spinner(f"Pulling Seeking Alpha analysis for {ticker} via RapidAPI..."):
+                articles = sa_api.fetch_analysis_list(ticker, size=max_articles)
+        except Exception as e:
+            st.error(f"Error while fetching Seeking Alpha analysis: {e}")
+            return
+
+        if not articles:
+            st.info(f"No Seeking Alpha analysis articles returned for {ticker}.")
+            # store empty so we don't keep trying silently
+            sa_cache[cache_key] = {"articles": [], "digest_text": None}
+            return
+
+        # ---------- 3) AI digest (delegates to sa_analysis_api) ----------
+        st.markdown("#### AI Analysis Digest")
+        try:
+            with st.spinner("Asking OpenAI for a short analysis digest..."):
+                # IMPORTANT: use the implementation from sa_analysis_api.py
+                digest_text = sa_api.build_sa_analysis_digest(
+                    symbol=ticker,
+                    articles=articles,
+                    model=model,
+                )
+        except Exception as e:
+            st.error(f"Error while calling OpenAI: {e}")
+            digest_text = None
+
+        # store in cache
+        sa_cache[cache_key] = {
+            "articles": articles,
+            "digest_text": digest_text,
+        }
+
+    # Case 3: no cache and user hasn't clicked yet → nothing to show
+    else:
+        st.info("Click the button above to fetch Seeking Alpha analysis for this ticker.")
         return
 
-    if not ticker:
-        st.warning("Please choose a ticker first.")
-        return
-
-    # ---------- 1) Fetch list of analysis articles ----------
-    try:
-        with st.spinner(f"Pulling Seeking Alpha analysis for {ticker} via RapidAPI..."):
-            articles = sa_api.fetch_analysis_list(ticker, size=max_articles)
-    except Exception as e:
-        st.error(f"Error while fetching Seeking Alpha analysis: {e}")
-        return
-
+    # At this point, we expect to have `articles` (possibly from cache) and maybe `digest_text`
     if not articles:
-        st.info(f"No Seeking Alpha analysis articles returned for {ticker}.")
+        st.info("No articles available for this ticker / configuration.")
         return
 
     # ---------- 2) Show table of articles ----------
@@ -809,21 +899,14 @@ def draw_seeking_alpha_news_section() -> None:
     st.markdown("#### Recent Seeking Alpha analysis articles")
     st.dataframe(df, use_container_width=True)
 
-    # ---------- 3) AI digest (delegates to sa_analysis_api) ----------
+    # ---------- 3) Render AI digest (using cached or fresh text) ----------
     st.markdown("#### AI Analysis Digest")
-    try:
-        with st.spinner("Asking OpenAI for a short analysis digest..."):
-            # IMPORTANT: use the implementation from sa_analysis_api.py
-            digest_text = sa_api.build_sa_analysis_digest(
-                symbol=ticker,
-                articles=articles,
-                model=model,
-            )
+    if digest_text:
         st.markdown(digest_text)
-    except Exception as e:
-        st.error(f"Error while calling OpenAI: {e}")
+    else:
+        st.info("No AI digest available for this ticker. Try refreshing if needed.")
 
-        # -----------------------------------------------------------
+    # -----------------------------------------------------------
     # 4) Pull and display full article bodies (cleaned)
     # -----------------------------------------------------------
     st.markdown("#### Article bodies (full, cleaned)")
@@ -2046,6 +2129,23 @@ def main():
 
     # ---------- Seeking Alpha news + AI digest ----------
     draw_seeking_alpha_news_section()
+
+    # ---------- Navigation: move to next ticker in the selected list ----------
+    selected_tickers = st.session_state.get("sa_selected_tickers_prev", [])
+    if selected_tickers and len(selected_tickers) > 1:
+        col_prev, col_spacer, col_next = st.columns([1, 3, 1])
+        with col_next:
+            if st.button("Next ticker ▶", key="sa_next_ticker"):
+                current_idx = st.session_state.get("sa_current_index", 0)
+                next_idx = (current_idx + 1) % len(selected_tickers)
+                st.session_state["sa_current_index"] = next_idx
+                st.rerun()
+        with col_prev:
+            if st.button("◀ Previous", key="sa_prev_ticker"):
+                current_idx = st.session_state.get("sa_current_index", 0)
+                prev_idx = (current_idx - 1) % len(selected_tickers)
+                st.session_state["sa_current_index"] = prev_idx
+                st.rerun()
 
 
     # Output path
