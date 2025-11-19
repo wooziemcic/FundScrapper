@@ -24,7 +24,6 @@ import json
 import hashlib
 import openai
 from dataclasses import dataclass
-from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Any
@@ -34,6 +33,11 @@ import streamlit as st
 import requests
 import sa_analysis_api as sa_api 
 from fund_families_biglist import BIG_LIST_RAW
+from podcasts_config import PODCASTS
+from tickers import tickers
+import math
+import subprocess
+from datetime import datetime, timedelta, timezone
 
 # pypdf compat
 try:
@@ -1012,6 +1016,319 @@ def draw_seeking_alpha_news_section() -> None:
                 cleaned_text = _re.sub(r"\n{3,}", "\n\n", tmp).strip()
 
             st.write(cleaned_text)
+
+def build_podcast_groups(n_groups: int = 9):
+    """
+    Split PODCASTS into up to n_groups buckets.
+    Each bucket is shown as a label -> list of podcast_ids.
+    Assumes each Podcast has .id and .name.
+    """
+    if not PODCASTS:
+        return {}
+
+    size = math.ceil(len(PODCASTS) / n_groups)
+    groups = {}
+    for i in range(n_groups):
+        start = i * size
+        chunk = PODCASTS[start:start + size]
+        if not chunk:
+            break
+
+        # Nice label like: "Set 1: Bloomberg Surveillance, Odd Lots, Money For The Rest..."
+        preview_names = [p.name for p in chunk[:4]]
+        label = f"Set {i+1}: " + ", ".join(preview_names)
+        if len(chunk) > 4:
+            label += " ..."
+
+        groups[label] = [p.id for p in chunk]
+
+    return groups
+
+def run_podcast_pipeline_from_ui(
+    days_back: int,
+    podcast_ids,
+    podcasts_root: Path,
+    excerpts_path: Path,
+    insights_path: Path,
+    model_name: str = "gpt-4o-mini",
+):
+    """
+    Orchestrates:
+      1) podcast_ingest.py  -> transcripts under podcasts_root
+      2) podcast_excerpts.py -> excerpts JSON (all tickers)
+      3) podcast_insights.py -> insights JSON (all tickers)
+    """
+    base_dir = Path(__file__).parent
+
+    # Make sure output dir exists
+    podcasts_root.mkdir(parents=True, exist_ok=True)
+
+    # -------- 1) INGEST: download + Whisper --------
+    MAX_PER_PODCAST = 3
+
+    ingest_cmd = [
+        sys.executable,
+        str(base_dir / "podcast_ingest.py"),
+        "--out", str(podcasts_root),
+        "--days", str(days_back),
+        "--whisper",
+        "--max-per-podcast", str(MAX_PER_PODCAST),
+    ]
+
+    # Restrict to selected podcast IDs (group) if provided
+    if podcast_ids:
+        ingest_cmd += ["--podcasts"] + list(podcast_ids)
+
+    ingest_proc = subprocess.run(
+        ingest_cmd,
+        text=True,
+        capture_output=True,
+    )
+    if ingest_proc.returncode != 0:
+        raise RuntimeError(f"podcast_ingest.py failed:\n{ingest_proc.stderr}")
+
+    # -------- 2) EXCERPTS: snippets for ALL tickers --------
+    excerpts_cmd = [
+        sys.executable,
+        str(base_dir / "podcast_excerpts.py"),
+        "--root", str(podcasts_root),
+        "--out", str(excerpts_path),
+        # no --tickers, no --days: script will use all tickers and all
+        # transcripts that were just ingested into podcasts_root
+    ]
+
+    excerpts_proc = subprocess.run(
+        excerpts_cmd,
+        text=True,
+        capture_output=True,
+    )
+    if excerpts_proc.returncode != 0:
+        raise RuntimeError(f"podcast_excerpts.py failed:\n{excerpts_proc.stderr}")
+
+    # -------- 3) INSIGHTS: GPT over all excerpts --------
+    insights_cmd = [
+        sys.executable,
+        str(base_dir / "podcast_insights.py"),
+        "--in", str(excerpts_path),
+        "--out", str(insights_path),
+        "--model", model_name,
+    ]
+    insights_proc = subprocess.run(
+        insights_cmd,
+        text=True,
+        capture_output=True,
+    )
+    if insights_proc.returncode != 0:
+        raise RuntimeError(f"podcast_insights.py failed:\n{insights_proc.stderr}")
+
+    return {
+        "ingest_stdout": ingest_proc.stdout,
+        "excerpts_stdout": excerpts_proc.stdout,
+        "insights_stdout": insights_proc.stdout,
+    }
+
+def draw_podcast_intelligence_section():
+    st.subheader("Podcast Intelligence – Company mentions across finance podcasts")
+
+    # --- 1) Choose podcast group (9 buckets) ---
+    podcast_groups = build_podcast_groups(n_groups=9)
+    group_labels = list(podcast_groups.keys())
+    selected_group_label = st.selectbox("Podcasts", group_labels)
+    selected_podcast_ids = podcast_groups.get(selected_group_label, [])
+
+     # Show all podcasts in this batch as "bubbles"
+    if selected_podcast_ids:
+        st.markdown("**Podcasts in this batch:**")
+
+        bubble_html = ""
+        for pod_name in selected_podcast_ids:
+            bubble_html += (
+                f"<span style="
+                f"'display:inline-block; margin:2px 6px 4px 0; "
+                f"padding:4px 10px; border-radius:999px; "
+                f"border:1px solid #999; font-size:0.85rem;'"
+                f">{pod_name}</span>"
+            )
+
+        st.markdown(bubble_html, unsafe_allow_html=True)
+
+    # --- 2) Date range -> converted to days_back ---
+    today = datetime.now(timezone.utc).date()
+    default_start = today - timedelta(days=2)
+    date_from, date_to = st.date_input(
+        "Episode date range",
+        value=(default_start, today),
+        format="YYYY/MM/DD",
+    )
+
+    if isinstance(date_from, list) or isinstance(date_to, list):
+        st.error("Please choose a single start and end date.")
+        return
+
+    if date_from > date_to:
+        st.error("Start date must be on or before end date.")
+        return
+
+    days_back = max(1, (date_to - date_from).days + 1)
+    st.caption(
+        f"{days_back} day lookback window "
+        f"({date_from.isoformat()} – {date_to.isoformat()})."
+    )
+
+    # --- Paths for pipeline outputs ---
+    base_dir = Path(__file__).parent
+    podcasts_root = base_dir / "data" / "podcasts_ui"
+    excerpts_path = base_dir / "data" / "podcast_excerpts_ui.json"
+    insights_path = base_dir / "data" / "podcast_insights_ui.json"
+
+    # --- 3) Run pipeline button ---
+    if st.button("Run fresh podcast analysis"):
+        try:
+            with st.spinner("Downloading podcasts, transcribing, and analyzing..."):
+                logs = run_podcast_pipeline_from_ui(
+                    days_back=days_back,
+                    podcast_ids=selected_podcast_ids,
+                    podcasts_root=podcasts_root,
+                    excerpts_path=excerpts_path,
+                    insights_path=insights_path,
+                    model_name="gpt-4o-mini",
+                )
+            st.success("Podcast analysis updated.")
+
+            with st.expander("Show pipeline logs"):
+                st.text("=== podcast_ingest.py ===")
+                st.code(logs["ingest_stdout"][-2000:])
+                st.text("=== podcast_excerpts.py ===")
+                st.code(logs["excerpts_stdout"][-2000:])
+                st.text("=== podcast_insights.py ===")
+                st.code(logs["insights_stdout"][-2000:])
+
+        except Exception as e:
+            st.error(f"Pipeline failed: {e}")
+            return
+
+        # --- Display results from the latest JSON ---
+
+    if not insights_path.exists():
+        st.info("Run the analysis first to see results.")
+        return
+
+    # Load excerpts + insights written by your scripts
+    try:
+        with open(excerpts_path, "r", encoding="utf-8") as f:
+            excerpts_data = json.load(f)  # dict: {ticker: [snippets]}
+    except Exception:
+        excerpts_data = {}
+
+    try:
+        with open(insights_path, "r", encoding="utf-8") as f:
+            insights_data = json.load(f)  # list: [ {ticker: ..., ...}, ... ]
+    except Exception:
+        insights_data = []
+
+    # --- figure out which tickers actually have podcast data ---
+    tickers_with_data = set()
+
+    # from excerpts
+    for t, snippets in excerpts_data.items():
+        if snippets:
+            tickers_with_data.add(t)
+
+    # from insights list
+    for insight in insights_data:
+        t = insight.get("ticker")
+        if t:
+            tickers_with_data.add(t)
+
+    if not tickers_with_data:
+        st.warning("No companies were mentioned in the selected podcasts / date range.")
+        return
+
+    # helper to show "Company (TICKER)" using your tickers.py mapping
+    def _format_company_label(sym: str) -> str:
+        names = tickers.get(sym, [])
+        primary = names[0] if names else sym
+        return f"{primary} ({sym})"
+
+    sorted_tickers = sorted(tickers_with_data)
+    labels = [_format_company_label(t) for t in sorted_tickers]
+    label_to_ticker = dict(zip(labels, sorted_tickers))
+
+    selected_label = st.selectbox(
+        "Company to inspect",
+        options=labels,
+        index=0,
+    )
+    selected_ticker = label_to_ticker[selected_label]
+
+    snippets = excerpts_data.get(selected_ticker, [])
+
+    # find the insight entry for this ticker in the list
+    insight_for_ticker = next(
+        (ins for ins in insights_data if ins.get("ticker") == selected_ticker),
+        {},
+    )
+
+    st.markdown(
+        f"{len(snippets)} snippet(s) found for **{selected_label}** "
+        f"between {date_from} and {date_to}."
+    )
+
+    # ---- Top section: stance / summary from podcast_insights.py ----
+    st.markdown("### AI Podcast Stance")
+
+    stance_label = insight_for_ticker.get("stance", "Unknown / Mixed")
+    stance_summary = insight_for_ticker.get(
+        "overall_summary",
+        "No stance summary is available yet for this company.",
+    )
+
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        st.markdown("**Stance**")
+        st.markdown(stance_label)
+    with col2:
+        st.markdown("**Summary across recent podcast mentions**")
+        st.write(stance_summary)
+
+    # ---- Snippet evidence ----
+    st.markdown("### Episode snippets (evidence)")
+
+    if not snippets:
+        st.info("No podcast snippets found for this company in the selected window.")
+        return
+
+    # Filter snippets by podcast group + date range (extra safety)
+    filtered = []
+    for s in snippets:
+        try:
+            pub_dt = datetime.fromisoformat(s["published"])
+        except Exception:
+            continue
+        pub_date = pub_dt.date()
+        if not (date_from <= pub_date <= date_to):
+            continue
+        if selected_podcast_ids and s.get("podcast_id") not in selected_podcast_ids:
+            continue
+        filtered.append(s)
+
+    if not filtered:
+        st.info("No snippets for this company within the selected podcasts + dates.")
+        return
+
+    for s in filtered:
+        title = s.get("title", "Untitled episode")
+        pod_name = s.get("podcast_name", s.get("podcast_id", ""))
+        pub = s.get("published", "")
+        header = f"{pod_name} – {title} ({pub[:10]})"
+
+        with st.expander(header):
+            st.write(s.get("snippet", ""))
+            meta_cols = st.columns(3)
+            meta_cols[0].markdown(f"**Podcast**: {pod_name}")
+            meta_cols[1].markdown(f"**Published**: {pub}")
+            if s.get("episode_url"):
+                meta_cols[2].markdown(f"[Open episode]({s['episode_url']})")
 
 # ---------- Manifest + Delta helpers ----------
 
@@ -2147,6 +2464,8 @@ def main():
                 st.session_state["sa_current_index"] = prev_idx
                 st.rerun()
 
+    # ---------- Podcast intelligence (ticker mentions across podcasts) ----------
+    draw_podcast_intelligence_section()
 
     # Output path
     st.markdown("<div class='cc-card'>", unsafe_allow_html=True)
