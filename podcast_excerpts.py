@@ -1,302 +1,342 @@
-# podcast_excerpts.py
+#!/usr/bin/env python3
+"""
+podcast_excerpts.py
 
-from __future__ import annotations
+Extracts:
+- Ticker-specific snippets from podcast transcripts
+- AND full-episode transcripts + metadata for fallback summarization
 
+Output JSON structure:
+
+{
+    "AAPL": [
+        { "snippet": "...", "title": "...", "podcast_id": "...", ... }
+    ],
+    "MSFT": [...],
+    "_episodes": {
+        "<podcast>__<ep_id>": {
+            "episode_id": "...",
+            "podcast_id": "...",
+            "title": "...",
+            "published": "...",
+            "episode_url": "...",
+            "transcript": "..."
+        }
+    }
+}
+"""
+
+import argparse
 import json
 import re
-from dataclasses import dataclass, asdict
-from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional
-from tickers import tickers as TICKERS
 
-from tickers import tickers  # Assumed: dict like { "JPM": {...}, "BAC": {...}, ... }
+from tickers import tickers  # full universe
 
 
-@dataclass
-class PodcastSnippet:
-    ticker: str
-    podcast_id: str
-    podcast_name: str
-    episode_id: str
-    title: str
-    published: str
-    snippet: str
-    transcript_source: str
-    sentence_index: int  # index of the sentence where the ticker was detected
+# -------------------------------
+# UTILS
+# -------------------------------
 
-
-def _load_episode_json(path: Path) -> Optional[dict]:
+def load_transcript(path: Path) -> str:
+    """Load transcript text from a .txt file (UTF-8)."""
     try:
-        with path.open("r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        print(f"[WARN] Failed to load {path}: {e}")
-        return None
-
-
-def _parse_iso_utc(ts: str) -> Optional[datetime]:
-    try:
-        dt = datetime.fromisoformat(ts)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        else:
-            dt = dt.astimezone(timezone.utc)
-        return dt
+        return path.read_text(encoding="utf-8")
     except Exception:
-        return None
+        return ""
 
 
-def _split_sentences(text: str) -> List[str]:
+def normalize_text(t: str) -> str:
     """
-    Very simple sentence splitter; good enough for windowed snippets.
+    Clean up transcript text for matching:
+    - strip out raw URLs (http/https)
+    - strip simple HTML tags
+    - normalize whitespace
     """
-    text = re.sub(r"\s+", " ", text).strip()
-    if not text:
-        return []
-    parts = re.split(r"(?<=[.!?])\s+", text)
-    return [p.strip() for p in parts if p.strip()]
+    if not t:
+        return ""
+
+    # drop URLs like https://www.amazon.com/...
+    t = re.sub(r"https?://\S+", " ", t)
+
+    # strip basic HTML tags like <p>, <a href="...">, <strong>, etc.
+    t = re.sub(r"<[^>]+>", " ", t)
+
+    # collapse whitespace
+    return " ".join(t.split())
 
 
-def _build_ticker_regex_map(tickers: List[str]) -> Dict[str, re.Pattern]:
+# -------------------------------
+# COMPANY MATCHING
+# -------------------------------
+
+# Very generic tokens that cause lots of false positives
+_GENERIC_TOKENS = {
+    "financial", "institution", "institutions", "group", "business",
+    "bank", "banks", "capital", "services", "service", "company",
+    "corp", "corporation", "inc", "inc.", "limited", "ltd", "holdings",
+    "trust", "national", "international", "global", "life",
+    "engineering", "first", "partners", "systems", "technologies"
+}
+
+# Common surname collisions seen in podcasts
+_COMMON_SURNAME_TOKENS = {
+    "johnson", "kim", "morgan", "dwayne", "kardashian"
+}
+
+
+def _clean_name(name: str) -> str:
+    """Lowercase, remove punctuation, collapse spaces."""
+    name = name.lower()
+    name = re.sub(r"[^a-z0-9\s]", " ", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name
+
+
+def _acronym_from_name(name: str) -> str:
     """
-    Build \bTICKER\b regex for each ticker to avoid partial matches.
+    Build acronym from multi-word names, e.g.
+    "International Business Machines" -> "ibm"
+    Only returns acronyms length >= 3.
     """
-    patterns: Dict[str, re.Pattern] = {}
-    for t in tickers:
-        t = (t or "").strip()
-        if not t:
+    tokens = [t for t in _clean_name(name).split() if t]
+    if len(tokens) < 2:
+        return ""
+    acronym = "".join(t[0] for t in tokens if t[0].isalpha())
+    if len(acronym) >= 3:
+        return acronym
+    return ""
+
+
+def build_company_regex(company_names, ticker=None):
+    """
+    Create a case-insensitive regex that matches:
+    - Exact company name(s)
+    - Cleaned variants (punctuation-stripped)
+    - Acronyms/abbreviations derived from multi-word names
+    - Optional ticker symbol (only if length >= 3 to avoid T/J noise)
+    - A safe "core" word (first word) only when it is specific
+    """
+    parts = []
+
+    # 1) Add raw + cleaned company names + acronyms
+    for cname in company_names or []:
+        if not cname:
             continue
-        pat = re.compile(rf"\b{re.escape(t)}\b", re.IGNORECASE)
-        patterns[t] = pat
-    return patterns
+
+        raw = cname.strip()
+        if raw:
+            s = re.escape(raw)
+            s = s.replace(r"\ ", r"\s+")
+            parts.append(s)
+
+        cleaned = _clean_name(raw)
+        if cleaned and cleaned != raw.lower():
+            s2 = re.escape(cleaned)
+            s2 = s2.replace(r"\ ", r"\s+")
+            parts.append(s2)
+
+        acr = _acronym_from_name(raw)
+        if acr:
+            parts.append(re.escape(acr))
+
+    # 2) Add ticker ONLY if it is not a short/common ticker
+    if ticker:
+        tkr = ticker.strip()
+        if len(tkr) >= 3:
+            parts.append(re.escape(tkr))
+
+    # 3) Add a safe "core" (first word) only if it's not generic/surname
+    for cname in company_names or []:
+        if not cname:
+            continue
+        core = _clean_name(cname).split()[0] if _clean_name(cname) else ""
+        if (
+            core
+            and len(core) >= 4
+            and core not in _GENERIC_TOKENS
+            and core not in _COMMON_SURNAME_TOKENS
+        ):
+            parts.append(re.escape(core))
+
+    # Deduplicate
+    deduped = []
+    seen = set()
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            deduped.append(p)
+
+    if not deduped:
+        # Avoid invalid regex edge-case
+        return r"^\b$"
+
+    return r"\b(" + "|".join(deduped) + r")\b"
 
 
-def _get_default_tickers() -> List[str]:
+def extract_snippets(transcript: str, company_names, ticker=None, window=2):
     """
-    Pull ticker symbols from your tickers.py universe.
-
-    Assumes TICKERS is a dict keyed by symbol, e.g. "JPM", "BAC", etc.
+    Extract contextual sentence snippets around company mentions.
     """
-    # If TICKERS is a dict keyed by ticker symbols:
-    return sorted(tickers.keys())
+    transcript = normalize_text(transcript)
+    if not transcript:
+        return []
+
+    sent_pat = r'[^\.!?]+[\.!?]'
+    sentences = re.findall(sent_pat, transcript)
+    if not sentences:
+        sentences = [transcript]
+
+    comp_regex = re.compile(build_company_regex(company_names, ticker=ticker), re.IGNORECASE)
+
+    hits = []
+    for i, sent in enumerate(sentences):
+        if comp_regex.search(sent):
+            start = max(0, i - window)
+            end = min(len(sentences), i + window + 1)
+            block = " ".join(sentences[start:end]).strip()
+            hits.append(block)
+
+    return hits
 
 
-def extract_podcast_snippets_for_tickers(
-    root_dir: Path,
-    tickers: List[str],
-    since: Optional[datetime] = None,
-    until: Optional[datetime] = None,
-    window: int = 2,
-) -> List[PodcastSnippet]:
-    """
-    Walk data/podcasts/<podcast_id>/*.json, load transcripts,
-    and extract snippets mentioning the given tickers.
+# ----------------------------------------------------------
+# NEW STRONG-ALIAS FILTER (added to reduce false positives)
+# ----------------------------------------------------------
 
-    Args:
-        root_dir: root folder where podcast_ingest.py wrote JSONs (e.g. data/podcasts)
-        tickers: list like ["JPM", "BAC", ...]
-        since/until: UTC datetime bounds on published date (optional)
-        window: number of sentences before/after the hit to include in snippet
+def _normalize_for_match(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
-    Returns:
-        List of PodcastSnippet records.
-    """
-    if until is None:
-        until = datetime.now(timezone.utc)
-    if since is None:
-        since = until - timedelta(days=7)
 
-    if not tickers:
+def _build_name_variants(company_names):
+    variants = []
+    for raw in company_names or []:
+        norm = _normalize_for_match(raw)
+        if not norm:
+            continue
+        tokens = norm.split()
+        # Skip names that are entirely generic words
+        if all(t in _GENERIC_TOKENS for t in tokens):
+            continue
+        variants.append(" ".join(tokens))
+    # Deduplicate
+    return list(dict.fromkeys(variants))
+
+
+def _snippet_has_specific_alias(snippet: str, company_names) -> bool:
+    variants = _build_name_variants(company_names)
+    if not variants:
+        return False
+    text = f" {_normalize_for_match(snippet)} "
+    return any(f" {v} " in text for v in variants)
+
+
+# -------------------------------
+# MAIN PIPELINE
+# -------------------------------
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", type=str, default="data/podcasts", help="Root folder of podcast transcripts")
+    parser.add_argument("--out", type=str, default="data/podcast_excerpts_ui.json", help="Output JSON path")
+    parser.add_argument("--tickers", nargs="*", help="Optional list of tickers to limit runs")
+    parser.add_argument("--window", type=int, default=2, help="Sentence window around company mentions")
+    args = parser.parse_args()
+
+    root = Path(args.root)
+    out_path = Path(args.out)
+
+    if args.tickers:
+        universe = args.tickers
+        print(f"[INFO] Using explicit tickers: {universe}")
+    else:
+        universe = list(tickers.keys())
         print("[INFO] No tickers provided; using full Cutler universe from tickers.py")
-        tickers = _get_default_tickers()
 
-    ticker_patterns = _build_ticker_regex_map(tickers)
-    snippets: List[PodcastSnippet] = []
+    # Output structure
+    output_data = {t: [] for t in universe}
+    output_data["_episodes"] = {}
 
-    print(
-        f"[INFO] Scanning podcasts under {root_dir} "
-        f"for {len(ticker_patterns)} tickers between {since.isoformat()} and {until.isoformat()}"
-    )
-
-    if not root_dir.exists():
-        print(f"[WARN] Root directory does not exist: {root_dir}")
-        return snippets
-
-    for pod_dir in root_dir.iterdir():
+    # Walk directories for episodes
+    for pod_dir in root.iterdir():
         if not pod_dir.is_dir():
             continue
 
-        for json_path in pod_dir.glob("*.json"):
-            ep = _load_episode_json(json_path)
-            if not ep:
+        podcast_id = pod_dir.name
+
+        for ep_dir in pod_dir.iterdir():
+            if not ep_dir.is_dir():
                 continue
 
-            published_str = ep.get("published") or ""
-            pub_dt = _parse_iso_utc(published_str)
-            if not pub_dt:
+            meta_file = ep_dir / "metadata.json"
+            txt_file = ep_dir / "transcript.txt"
+            if not meta_file.exists() or not txt_file.exists():
                 continue
 
-            if pub_dt < since or pub_dt > until:
+            try:
+                meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            except Exception:
                 continue
 
-            transcript = ep.get("transcript_text") or ""
-            if not transcript:
+            ep_id = meta.get("episode_id")
+            title = meta.get("title", "")
+            published = meta.get("published", "")
+            episode_url = meta.get("episode_url", "")
+
+            transcript = load_transcript(txt_file)
+            if not transcript.strip():
                 continue
 
-            sentences = _split_sentences(transcript)
-            if not sentences:
-                continue
-
-            meta = {
-                "podcast_id": ep.get("podcast_id") or pod_dir.name,
-                "podcast_name": ep.get("podcast_name") or pod_dir.name,
-                "episode_id": ep.get("episode_id") or json_path.stem,
-                "title": ep.get("title") or "Untitled Episode",
-                "published": published_str,
-                "transcript_source": ep.get("transcript_source") or "unknown",
+            # Save full episode transcript for fallback summarization
+            episode_uid = f"{podcast_id}__{ep_id}"
+            output_data["_episodes"][episode_uid] = {
+                "episode_id": ep_id,
+                "podcast_id": podcast_id,
+                "title": title,
+                "published": published,
+                "episode_url": episode_url,
+                "transcript": transcript,
             }
 
-            # For each ticker, scan all sentences
-            for ticker, pattern in ticker_patterns.items():
-                for idx, sent in enumerate(sentences):
-                    if not pattern.search(sent):
+            # Extract snippets per ticker
+            for t in universe:
+                names = tickers.get(t, [])
+                if not names:
+                    continue
+
+                snippets = extract_snippets(transcript, names, ticker=t, window=args.window)
+                if not snippets:
+                    continue
+
+                # Store each match with metadata
+                for sn in snippets:
+
+                    # ----------------------------------------------------
+                    # NEW STRONG-ALIAS FILTER (exactly where needed)
+                    # ----------------------------------------------------
+                    if not _snippet_has_specific_alias(sn, names):
                         continue
 
-                    # Found a match – build a window of sentences around it
-                    start = max(0, idx - window)
-                    end = min(len(sentences), idx + window + 1)
-                    snippet_text = " ".join(sentences[start:end]).strip()
+                    output_data[t].append({
+                        "ticker": t,
+                        "company_names": names,
+                        "snippet": sn,
+                        "podcast_id": podcast_id,
+                        "episode_id": ep_id,
+                        "title": title,
+                        "published": published,
+                        "episode_url": episode_url,
+                    })
 
-                    snippet = PodcastSnippet(
-                        ticker=ticker,
-                        snippet=snippet_text,
-                        sentence_index=idx,
-                        **meta,
-                    )
-                    snippets.append(snippet)
+    non_empty = sum(len(v) for k, v in output_data.items() if k != "_episodes")
+    print(f"[INFO] Extracted {non_empty} total snippets")
 
-    print(f"[INFO] Extracted {len(snippets)} raw snippets")
-    return snippets
+    out_path.write_text(json.dumps(output_data, indent=2), encoding="utf-8")
+    print(f"[OK] Saved episode data + snippets to {out_path}")
 
-
-def save_snippets_by_ticker(snippets: List[PodcastSnippet], out_path: Path) -> None:
-    """
-    Save snippets grouped by ticker to a JSON file:
-
-    {
-      "JPM": [ {...snippet1...}, {...snippet2...} ],
-      "BAC": [ ... ],
-      ...
-    }
-    """
-    grouped: Dict[str, List[dict]] = {}
-    for sn in snippets:
-        grouped.setdefault(sn.ticker, []).append(asdict(sn))
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w", encoding="utf-8") as f:
-        json.dump(grouped, f, ensure_ascii=False, indent=2)
-
-    print(
-        f"[OK] Saved {len(snippets)} snippets for {len(grouped)} tickers to {out_path}"
-    )
-
-
-# ------------------------------
-# CLI usage
-# ------------------------------
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Extract ticker-aware snippets from podcast transcripts."
-    )
-    parser.add_argument(
-        "--root",
-        type=str,
-        default="data/podcasts",
-        help="Root directory where podcast_ingest.py wrote episode JSON files.",
-    )
-    parser.add_argument(
-        "--out",
-        type=str,
-        default="data/podcast_excerpts.json",
-        help="Output JSON file for grouped snippets.",
-    )
-    parser.add_argument(
-        "--tickers",
-        nargs="*",
-        help="Optional list of tickers to search. If omitted, use all companies from tickers.py",
-    )
-
-    args = parser.parse_args()
-
-    if args.tickers:
-        tickers_to_use = args.tickers
-    else:
-        # default: all tickers from tickers.py
-        tickers_to_use = sorted(TICKERS.keys())
-
-    parser.add_argument(
-        "--days",
-        type=int,
-        default=7,
-        help="Look back this many days from now.",
-    )
-    parser.add_argument(
-        "--window",
-        type=int,
-        default=2,
-        help="Number of sentences before/after the hit to include in snippet.",
-    )
-
-    args = parser.parse_args()
-
-    now = datetime.now(timezone.utc)
-    since = now - timedelta(days=args.days)
-
-    root_dir = Path(args.root)
-    out_path = Path(args.out)
-
-    tickers_arg = args.tickers or []
-
-    snippets = extract_podcast_snippets_for_tickers(
-        root_dir=root_dir,
-        tickers=tickers_arg,
-        since=since,
-        until=now,
-        window=args.window,
-    )
-    save_snippets_by_ticker(snippets, out_path)
-
-
-
-def build_ticker_patterns(ticker_list):
-    """
-    Build regex patterns that match company names / aliases, not single-letter tickers.
-    """
-    patterns = {}
-
-    for symbol in ticker_list:
-        name_variants = TICKERS.get(symbol, [])
-        if not name_variants:
-            continue
-
-        regex_parts = []
-        for name in name_variants:
-            # Skip ultra-short tokens like 'C', 'F', etc.
-            if len(name.strip()) <= 2:
-                continue
-
-            escaped = re.escape(name.strip())
-            # Word-boundary match, case-insensitive
-            regex_parts.append(rf"\b{escaped}\b")
-
-        if not regex_parts:
-            continue
-
-        patterns[symbol] = re.compile("|".join(regex_parts), re.IGNORECASE)
-
-    return patterns
+    main()

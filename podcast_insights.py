@@ -1,361 +1,621 @@
-# podcast_insights.py
 from __future__ import annotations
 
 import argparse
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
+import re
 
 import openai
+
+# Try to pull full Cutler universe for nicer company labels (optional)
+try:
+    from tickers import tickers as CUTLER_TICKERS
+except Exception:
+    CUTLER_TICKERS = {}
 
 # ------------------------------
 # OpenAI setup
 # ------------------------------
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_KEY")
-
-if not OPENAI_API_KEY:
-    raise RuntimeError(
-        "OPENAI_API_KEY environment variable is not set. "
-        "Please set it before running podcast_insights.py"
-    )
-
-openai.api_key = OPENAI_API_KEY
-
-# ------------------------------
-# Optional ticker -> company names
-# ------------------------------
-
-try:
-    # Same module used in podcast_excerpts.py
-    from tickers import tickers as CUTLER_TICKERS  # dict like {"ABBV": ["AbbVie"], ...}
-except Exception:
-    CUTLER_TICKERS: Dict[str, List[str]] = {}
+if OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
 
 
-def _get_company_names_for_ticker(ticker: str) -> List[str]:
-    """
-    Prefer human-readable company names from tickers.py.
-    Fallback to [ticker] if nothing is defined.
-    """
-    names = CUTLER_TICKERS.get(ticker, [])
-    if isinstance(names, str):
-        names = [names]
-    names = [n for n in (names or []) if n]
-    return names or [ticker]
+@dataclass
+class PodcastSnippet:
+    ticker: str
+    podcast_id: str
+    episode_id: str
+    podcast_name: str
+    title: str
+    published: str
+    snippet: str
+    episode_url: str | None = None
+    company_names: List[str] | None = None
 
 
-# ------------------------------
-# Prompt design
-# ------------------------------
-
-PODCAST_SYSTEM_PROMPT = """
-You are an experienced buy-side equity analyst.
-
-You will receive:
-- A stock ticker and its company names.
-- Several short excerpts from recent finance / investing podcasts where this ticker was mentioned.
-
-Your job is to infer, using ONLY these podcast excerpts (no outside knowledge):
-
-1) What is the implied stance on the stock?
-   - Map this to one of: "buy", "hold", "sell", or "unclear".
-   - "buy" = broadly positive / bullish, upside-focused, would add or initiate.
-   - "hold" = more neutral / balanced, maintain position, unclear skew.
-   - "sell" = clearly negative / bearish, would reduce or exit.
-   - "unclear" = there is not enough signal in the snippets.
-
-2) Give a confidence score (0.0–1.0) based purely on the strength and clarity of what is said
-   in the excerpts (0.0 = no signal, 1.0 = extremely clear and strong signal).
-
-3) Write a concise overall_summary in plain English (3–6 sentences, max ~180 words)
-   that explains how the podcasts are framing the stock: what they like/dislike,
-   main drivers, macro/sector tone, and risk/reward.
-
-4) Provide:
-   - time_horizon: e.g. "3–6 months", "6–12 months", "multi-year", or "unclear".
-   - key_themes: 2–6 bullet-style phrases capturing the big ideas.
-   - risks: 0–5 short bullet-style phrases.
-   - opportunities: 0–5 short bullet-style phrases.
-   - podcast_evidence: 0–6 short strings that reference specific episodes or quotes
-     (e.g. "On On the Balance Sheet – 'If You Stick Around Long Enough...' they highlight X").
-
-CRITICAL RULES:
-- Base everything ONLY on the snippets provided.
-- If the snippets do not say anything meaningful about the stock, set stance="unclear",
-  confidence near 0.0, and explain that there was no usable signal.
-- Do not fabricate detailed fundamentals, numbers, or events that are not clearly implied
-  by the excerpts.
-- Output must be a single JSON object with the exact fields described – no markdown,
-  no extra commentary.
-""".strip()
+@dataclass
+class EpisodeRecord:
+    episode_uid: str
+    episode_id: str
+    podcast_id: str
+    title: str
+    published: str
+    episode_url: str | None
+    transcript: str
 
 
-def _build_user_message(
+# ---------------------------------------------------------------------
+# Prompt helpers
+# ---------------------------------------------------------------------
+
+COMPANY_SYSTEM_PROMPT = """You are a research assistant helping a buy-side
+investment firm understand how specific companies are discussed across
+finance podcasts.
+
+Given short excerpts where a particular stock or company is mentioned,
+infer the qualitative stance of the discussion (bullish, bearish,
+neutral/hold, or unclear) and summarise the reasoning in a structured
+JSON format.
+
+You are NOT giving investment advice. You are only summarizing tone and
+qualitative commentary from the excerpts.
+
+Definitions:
+- "buy": clearly optimistic tone, expecting upside or strongly positive
+  vs peers.
+- "sell": clearly negative tone, highlighting major risks, overvaluation,
+  or downside vs peers.
+- "hold": mixed, balanced, or only mildly directional; basically
+  monitor/neutral.
+- "unclear": the company is mentioned but not enough signal to infer a
+  stance (passing reference, lists of names, etc.).
+
+You must output a single JSON object with keys:
+- ticker (string)
+- stance ("buy" | "sell" | "hold" | "unclear")
+- stance_confidence (float 0.0–1.0)
+- overall_summary (string, 3–7 sentences)
+- supporting_points (list of strings)
+- risks_or_headwinds (list of strings)
+- episodes (list of episode objects):
+    [{
+       "podcast_name": ...,
+       "episode_title": ...,
+       "published": ...,
+       "episode_url": ...,
+       "episode_view": "2–4 sentences on how this episode contributes to the stance"
+     }]
+
+Rules:
+- Use ONLY the info in the excerpts.
+- Do NOT fabricate numbers, events, or fundamentals that are not
+  clearly implied.
+- If different episodes disagree, you may choose "hold" and explain both
+  sides.
+- If the company is only mentioned briefly, you may choose "unclear",
+  but still provide a useful narrative summary of what IS being
+  discussed (macro themes, sector comments, etc.).
+- Respond with VALID JSON only. No extra commentary.
+"""
+
+
+EPISODE_SYSTEM_PROMPT = """You are a senior research assistant for a buy-side
+investment firm. Your job is to summarise full finance podcast episodes
+for busy portfolio managers.
+
+You will be given the transcript of ONE episode. Produce a concise,
+medium-length paragraph that captures:
+- core topic and thesis of the episode
+- key macro or sector themes
+- any notable risks, tensions, or debates
+- overall tone (constructive, cautious, speculative, etc.)
+
+You are not making stock recommendations, only summarizing what is
+discussed.
+
+Output MUST be JSON with a single key:
+{ "summary": "..." }
+
+Do NOT include any commentary outside JSON.
+"""
+
+
+def build_company_user_message(
     ticker: str,
     company_names: List[str],
-    snippets: List[Dict[str, Any]],
+    snippets: List[PodcastSnippet],
 ) -> str:
-    """
-    Build the user content string that lists all podcast snippets and
-    instructs the model to output JSON.
-    """
+    company_label = ", ".join(company_names) if company_names else ticker
     lines: List[str] = []
 
-    lines.append(f"Ticker: {ticker}")
-    if company_names:
-        lines.append(f"Company names: {', '.join(company_names)}")
-    else:
-        lines.append("Company names: (not available)")
+    lines.append(
+        f"You are analyzing recent podcast excerpts that mention the company "
+        f"{company_label} (ticker: {ticker})."
+    )
+    lines.append("Each snippet includes podcast metadata and the surrounding text where the company appears.")
+    lines.append("")
+    lines.append("EXCERPTS:")
+
+    for i, sn in enumerate(snippets, start=1):
+        lines.append(f"[Snippet {i}]")
+        lines.append(f"Podcast: {sn.podcast_name}")
+        lines.append(f"Episode: {sn.title}")
+        lines.append(f"Published: {sn.published}")
+        if sn.episode_url:
+            lines.append(f"URL: {sn.episode_url}")
+        lines.append("Text:")
+        lines.append(sn.snippet.strip())
+        lines.append("")
 
     lines.append("")
-    lines.append("Below are recent podcast excerpts mentioning this ticker.")
-    lines.append("Use ONLY these excerpts to form your view.")
-    lines.append("")
-
-    for idx, sn in enumerate(snippets, start=1):
-        podcast_name = sn.get("podcast_name") or sn.get("podcast_id") or "Unknown podcast"
-        title = sn.get("title") or sn.get("episode_title") or "Untitled episode"
-        published = sn.get("published") or sn.get("episode_date") or ""
-        transcript_source = sn.get("transcript_source") or "unknown"
-        url = sn.get("url") or ""
-
-        lines.append(f"--- Excerpt {idx} ---")
-        lines.append(f"Podcast: {podcast_name}")
-        lines.append(f"Episode title: {title}")
-        if published:
-            lines.append(f"Published: {published}")
-        if url:
-            lines.append(f"URL: {url}")
-        lines.append(f"Transcript source: {transcript_source}")
-
-        sent_idx = sn.get("sentence_index")
-        if sent_idx is not None:
-            lines.append(f"Sentence index in transcript: {sent_idx}")
-
-        snippet_text = (sn.get("snippet") or "").strip()
-        if snippet_text:
-            lines.append("")
-            lines.append("Excerpt text:")
-            lines.append(snippet_text)
-        else:
-            lines.append("")
-            lines.append("Excerpt text: [missing or empty]")
-
-        lines.append("")  # blank line between excerpts
-
-    lines.append("")
-    lines.append("Now respond with a STRICT JSON object with the following keys:")
-    lines.append("")
-    lines.append("ticker: string")
-    lines.append("company_names: list of strings")
-    lines.append('stance: one of ["buy", "hold", "sell", "unclear"]')
-    lines.append("confidence: float between 0.0 and 1.0")
-    lines.append("overall_summary: short paragraph (max ~180 words)")
-    lines.append('time_horizon: short string like "3–6 months", "6–12 months", "multi-year", or "unclear"')
-    lines.append("key_themes: list of short strings")
-    lines.append("risks: list of short strings")
-    lines.append("opportunities: list of short strings")
-    lines.append("podcast_evidence: list of short strings pointing to specific episodes/quotes")
-    lines.append("")
-    lines.append("Output ONLY valid JSON. Do not include backticks or any extra commentary.")
-
+    lines.append("Now respond with a single JSON object with the keys described in the system prompt.")
     return "\n".join(lines)
 
 
-def _fallback_result(
+def build_episode_user_message(ep: EpisodeRecord, max_chars: int = 6000) -> str:
+    """
+    Build a prompt for summarising a single episode. Transcript is truncated
+    to keep tokens under control.
+    """
+    transcript = ep.transcript.strip()
+    if len(transcript) > max_chars:
+        transcript = transcript[:max_chars]
+
+    lines: List[str] = []
+    lines.append(f"Podcast: {ep.podcast_id}")
+    lines.append(f"Episode title: {ep.title}")
+    lines.append(f"Published: {ep.published}")
+    if ep.episode_url:
+        lines.append(f"URL: {ep.episode_url}")
+    lines.append("")
+    lines.append("TRANSCRIPT:")
+    lines.append(transcript)
+    lines.append("")
+    lines.append('Respond with JSON of the form: { "summary": "..." }')
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------
+# OpenAI wrappers
+# ---------------------------------------------------------------------
+
+def call_chat_completion(model: str, system_prompt: str, user_message: str) -> str:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY (or OPENAI_KEY) is not set in environment.")
+    resp = openai.ChatCompletion.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        temperature=0.2,
+    )
+    return resp["choices"][0]["message"]["content"]
+
+
+def generate_company_insight(
     ticker: str,
     company_names: List[str],
-    error_message: str,
-) -> Dict[str, Any]:
-    """
-    Use this when OpenAI fails or the JSON cannot be parsed.
-    """
-    return {
-        "ticker": ticker,
-        "company_names": company_names,
-        "stance": "unclear",
-        "confidence": 0.0,
-        "overall_summary": f"OpenAI call failed for this ticker: {error_message}",
-        "time_horizon": "unclear",
-        "key_themes": [],
-        "risks": [],
-        "opportunities": [],
-        "podcast_evidence": [],
-        "raw_model_output": "",
-    }
-
-
-def _normalize_result(
-    ticker: str,
-    company_names: List[str],
-    parsed: Dict[str, Any],
-    raw_model_output: str,
-) -> Dict[str, Any]:
-    """
-    Ensure we always return a dict with all expected keys,
-    even if the model omitted some.
-    """
-    out: Dict[str, Any] = dict(parsed or {})
-
-    out.setdefault("ticker", ticker)
-    out.setdefault("company_names", company_names)
-    out.setdefault("stance", "unclear")
-    out.setdefault("confidence", 0.0)
-    out.setdefault("overall_summary", "")
-    out.setdefault("time_horizon", "unclear")
-    out.setdefault("key_themes", [])
-    out.setdefault("risks", [])
-    out.setdefault("opportunities", [])
-    out.setdefault("podcast_evidence", [])
-    out["raw_model_output"] = raw_model_output or json.dumps(parsed or {}, ensure_ascii=False)
-
-    return out
-
-
-def _call_openai_for_ticker(
-    ticker: str,
-    company_names: List[str],
-    snippets: List[Dict[str, Any]],
+    snippets: List[PodcastSnippet],
     model: str,
 ) -> Dict[str, Any]:
     """
-    Call OpenAI ChatCompletion for a single ticker's podcast snippets.
-    Returns a dict ready to be written to podcast_insights_all.json.
+    Normal path: company *is* mentioned in excerpts.
     """
     if not snippets:
-        return _fallback_result(
-            ticker,
-            company_names,
-            "No podcast snippets available for this ticker.",
-        )
+        return {
+            "ticker": ticker,
+            "company_names": company_names,
+            "stance": "unclear",
+            "stance_confidence": 0.0,
+            "overall_summary": "No valid excerpts were available for this ticker.",
+            "supporting_points": [],
+            "risks_or_headwinds": [],
+            "episodes": [],
+            "episode_summaries": [],
+            "raw_model_output": "",
+            "has_mentions": False,
+        }
 
-    user_content = _build_user_message(ticker, company_names, snippets)
+    user_message = build_company_user_message(ticker, company_names, snippets)
 
     try:
-        response = openai.ChatCompletion.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": PODCAST_SYSTEM_PROMPT},
-                {"role": "user", "content": user_content},
-            ],
-            temperature=0.1,
-            max_tokens=900,
-        )
-
-        content = response["choices"][0]["message"]["content"]
+        content = call_chat_completion(model, COMPANY_SYSTEM_PROMPT, user_message)
     except Exception as e:
-        return _fallback_result(ticker, company_names, str(e))
+        return {
+            "ticker": ticker,
+            "company_names": company_names,
+            "stance": "unclear",
+            "stance_confidence": 0.0,
+            "overall_summary": f"OpenAI call failed: {e}",
+            "supporting_points": [],
+            "risks_or_headwinds": [],
+            "episodes": [],
+            "episode_summaries": [],
+            "raw_model_output": "",
+            "has_mentions": True,
+        }
 
-    # Try to parse JSON
     try:
         parsed = json.loads(content)
     except Exception:
-        # If parsing fails, still return something useful
-        fallback = _fallback_result(
-            ticker,
-            company_names,
-            "Model returned non-JSON content.",
+        # Fallback: treat the content as a free-form summary
+        return {
+            "ticker": ticker,
+            "company_names": company_names,
+            "stance": "unclear",
+            "stance_confidence": 0.0,
+            "overall_summary": content.strip(),
+            "supporting_points": [],
+            "risks_or_headwinds": [],
+            "episodes": [],
+            "episode_summaries": [],
+            "raw_model_output": content,
+            "has_mentions": True,
+        }
+
+    return {
+        "ticker": parsed.get("ticker", ticker),
+        "company_names": company_names,
+        "stance": parsed.get("stance", "unclear"),
+        "stance_confidence": float(parsed.get("stance_confidence", 0.0) or 0.0),
+        "overall_summary": (parsed.get("overall_summary") or "").strip(),
+        "supporting_points": parsed.get("supporting_points") or [],
+        "risks_or_headwinds": parsed.get("risks_or_headwinds") or [],
+        "episodes": parsed.get("episodes") or [],
+        "episode_summaries": [],
+        "raw_model_output": content,
+        "has_mentions": True,
+    }
+
+
+def generate_episode_summary(ep: EpisodeRecord, model: str) -> str:
+    """
+    Generate a medium-length paragraph summary for one episode.
+    Used in fallback mode when a ticker has *no* snippets.
+    """
+    user_message = build_episode_user_message(ep)
+    try:
+        content = call_chat_completion(model, EPISODE_SYSTEM_PROMPT, user_message)
+    except Exception as e:
+        return f"Failed to summarise this episode due to an API error: {e}"
+
+    try:
+        parsed = json.loads(content)
+        summary = parsed.get("summary", "").strip()
+        if summary:
+            return summary
+    except Exception:
+        pass
+
+    return content.strip()
+
+
+# ---------------------------------------------------------------------
+# Loading excerpts + episodes
+# ---------------------------------------------------------------------
+
+def load_excerpts_and_episodes(path: Path) -> Tuple[Dict[str, List[PodcastSnippet]], Dict[str, EpisodeRecord]]:
+    """
+    Load the JSON from podcast_excerpts.py and split into:
+    - excerpts_by_ticker: { ticker: [PodcastSnippet, ...], ... }
+    - episodes: { episode_uid: EpisodeRecord, ... }
+    """
+    with path.open("r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    episodes_raw = raw.pop("_episodes", {})
+    episodes: Dict[str, EpisodeRecord] = {}
+    for uid, obj in episodes_raw.items():
+        episodes[uid] = EpisodeRecord(
+            episode_uid=uid,
+            episode_id=obj.get("episode_id", ""),
+            podcast_id=obj.get("podcast_id", ""),
+            title=obj.get("title", ""),
+            published=obj.get("published", ""),
+            episode_url=obj.get("episode_url"),
+            transcript=obj.get("transcript", ""),
         )
-        fallback["overall_summary"] = content.strip()
-        fallback["raw_model_output"] = content
-        return fallback
 
-    return _normalize_result(ticker, company_names, parsed, content)
+    excerpts_by_ticker: Dict[str, List[PodcastSnippet]] = {}
+    for ticker, items in raw.items():
+        snippets: List[PodcastSnippet] = []
+        for s in items:
+            snippets.append(
+                PodcastSnippet(
+                    ticker=ticker,
+                    podcast_id=s.get("podcast_id", ""),
+                    episode_id=s.get("episode_id", ""),
+                    podcast_name=s.get("podcast_name", s.get("podcast_id", "")),
+                    title=s.get("title", ""),
+                    published=s.get("published", ""),
+                    snippet=s.get("snippet", ""),
+                    episode_url=s.get("episode_url"),
+                    company_names=s.get("company_names") or [],
+                )
+            )
+        excerpts_by_ticker[ticker] = snippets
+
+    return excerpts_by_ticker, episodes
 
 
-# ------------------------------
-# Main CLI
-# ------------------------------
+# --- Heuristic for "strong" company mentions -----------------------------
+
+# Generic finance/industry words – if a company name is *only* these,
+# we treat it as too generic to use as an explicit alias.
+_GENERIC_TOKENS = {
+    "financial", "institution", "institutions", "group", "business",
+    "bank", "banks", "capital", "services", "service", "company",
+    "corp", "corporation", "inc", "inc.", "limited", "ltd", "holdings",
+    "trust", "national", "international", "global", "life", "met",
+    "engineering", "first"
+}
 
 
-def main() -> None:
+def _normalize_for_match(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _build_name_variants(company_names):
+    variants = []
+    for raw in company_names or []:
+        norm = _normalize_for_match(raw)
+        if not norm:
+            continue
+        tokens = norm.split()
+        if all(t in _GENERIC_TOKENS for t in tokens):
+            continue
+        variants.append(" ".join(tokens))
+    # dedupe
+    seen = set()
+    out = []
+    for v in variants:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def _snippet_has_specific_alias(snippet: str, company_names) -> bool:
+    variants = _build_name_variants(company_names)
+    if not variants:
+        return False
+    text = f" {_normalize_for_match(snippet)} "
+    return any(f" {v} " in text for v in variants)
+
+
+def has_strong_company_match(
+    snippets: list["PodcastSnippet"],
+    ticker: str,
+    company_names: list[str],
+) -> bool:
+    """
+    Return True only if at least one snippet clearly contains the company
+    name (not just generic words or fuzzy noise).
+
+    We deliberately do *not* rely on the ticker symbol itself here to avoid
+    false positives for tickers like T, J, etc.
+    """
+    if not snippets:
+        return False
+
+    variants = _build_name_variants(company_names)
+    if not variants:
+        # No specific name tokens to look for – treat as "no strong signal"
+        return False
+
+    # Check each snippet's text
+    for sn in snippets:
+        text = _normalize_for_match(sn.snippet or "")
+        if not text:
+            continue
+        padded = f" {text} "
+        for v in variants:
+            if f" {v} " in padded:
+                return True
+
+    return False
+
+
+# ---------------------------------------------------------------------
+# Main build function
+# ---------------------------------------------------------------------
+
+def build_insights(
+    excerpts_by_ticker: Dict[str, List[PodcastSnippet]],
+    episodes: Dict[str, EpisodeRecord],
+    model: str,
+) -> List[Dict[str, Any]]:
+    """
+    Build insights for each ticker.
+
+    Behaviour:
+
+    - First, we decide which tickers have *strong* mentions using
+      has_strong_company_match (explicit company name in text).
+    - If AT LEAST ONE ticker has strong mentions:
+        * Those tickers get full AI stance analysis (Company Mode).
+        * Other tickers are marked has_mentions=False and get no episode
+          summaries attached.
+    - If NO ticker has strong mentions:
+        * We do NOT produce any company-level stances.
+        * Instead, we generate episode-level summaries once and attach the
+          SAME episode_summaries list to every ticker
+          (final.py merges them and goes into Episode Mode).
+    """
+    episode_summaries_cache: Dict[str, str] = {}
+    results: List[Dict[str, Any]] = []
+
+    tickers_sorted = sorted(excerpts_by_ticker.keys())
+    print(f"[INFO] Building podcast insights for {len(tickers_sorted)} tickers using model {model}")
+
+    # ---------- 1) Pre-compute company_names per ticker ----------
+    per_ticker_company_names: Dict[str, List[str]] = {}
+    for ticker in tickers_sorted:
+        snippets = excerpts_by_ticker[ticker]
+        company_names: List[str] = []
+
+        # union of company_names embedded in snippets
+        for sn in snippets:
+            if sn.company_names:
+                for name in sn.company_names:
+                    if name not in company_names:
+                        company_names.append(name)
+
+        # if still empty, pull from master tickers mapping
+        if not company_names and ticker in CUTLER_TICKERS:
+            names_from_master = CUTLER_TICKERS.get(ticker, [])
+            company_names = list(names_from_master)
+
+        per_ticker_company_names[ticker] = company_names
+
+    # ---------- 2) Decide “strong mention” vs none ----------
+    strong_flags: Dict[str, bool] = {}
+    for ticker in tickers_sorted:
+        snippets = excerpts_by_ticker[ticker]
+        company_names = per_ticker_company_names.get(ticker, [])
+        strong = has_strong_company_match(snippets, ticker, company_names)
+        strong_flags[ticker] = strong
+        print(f"[INFO] Strong-mention check for {ticker}: {strong} (snippets={len(snippets)})")
+
+    any_strong_mentions = any(strong_flags.values())
+    print(f"[INFO] Any strong mentions? {any_strong_mentions}")
+
+    # ---------- 3) If NO strong mentions, build episode summaries once ----------
+    global_episode_summaries: List[Dict[str, Any]] = []
+    if not any_strong_mentions and episodes:
+        print("[INFO] No strong company mentions detected. Generating episode summaries for Episode Mode.")
+        for uid, ep in episodes.items():
+            if uid in episode_summaries_cache:
+                summary = episode_summaries_cache[uid]
+            else:
+                summary = generate_episode_summary(ep, model=model)
+                episode_summaries_cache[uid] = summary
+
+            global_episode_summaries.append(
+                {
+                    "episode_id": ep.episode_id or uid,
+                    "podcast_id": ep.podcast_id,
+                    "podcast_name": ep.podcast_id,  # we don't have a nicer name here
+                    "episode_title": ep.title,
+                    "published": ep.published,
+                    "episode_url": ep.episode_url,
+                    "summary": summary,
+                }
+            )
+
+    # ---------- 4) Build per-ticker insight objects ----------
+    for idx, ticker in enumerate(tickers_sorted, start=1):
+        snippets = excerpts_by_ticker[ticker]
+        company_names = per_ticker_company_names.get(ticker, [])
+        print(
+            f"[INFO] [{idx}/{len(tickers_sorted)}] Processing {ticker} "
+            f"with {len(snippets)} snippets (strong={strong_flags[ticker]})..."
+        )
+
+        if strong_flags[ticker]:
+            # Normal company-specific stance path
+            insight = generate_company_insight(
+                ticker=ticker,
+                company_names=company_names,
+                snippets=snippets,
+                model=model,
+            )
+            insight["has_mentions"] = True
+
+        else:
+            # No strong mention for this ticker
+            if not any_strong_mentions and global_episode_summaries:
+                # Global Episode Mode: attach shared episode summaries
+                episode_summaries = global_episode_summaries
+            else:
+                # There ARE other tickers with strong mentions, so we do not
+                # attach episode summaries to this ticker.
+                episode_summaries = []
+
+            insight = {
+                "ticker": ticker,
+                "company_names": company_names,
+                "stance": "not_mentioned",
+                "stance_confidence": 0.0,
+                "overall_summary": (
+                    "This company was not explicitly and clearly mentioned in "
+                    "any of the selected podcast transcripts for this batch."
+                    if not any_strong_mentions
+                    else "This company does not have clear, explicit mentions "
+                         "in the excerpts used for company-level analysis."
+                ),
+                "supporting_points": [],
+                "risks_or_headwinds": [],
+                "episodes": [],
+                "episode_summaries": episode_summaries,
+                "raw_model_output": "",
+                "has_mentions": False,
+            }
+
+        results.append(insight)
+
+    return results
+
+
+# ---------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build AI insights from podcast excerpts for each ticker."
+        description="Generate podcast AI insights from excerpts JSON."
     )
     parser.add_argument(
         "--in",
-        dest="input_path",
-        type=str,
+        dest="in_path",
         required=True,
-        help="Input JSON produced by podcast_excerpts.py (grouped by ticker).",
+        help="Input JSON from podcast_excerpts.py",
     )
     parser.add_argument(
         "--out",
-        dest="output_path",
-        type=str,
+        dest="out_path",
         required=True,
-        help="Output JSON path for podcast insights.",
+        help="Output JSON path for insights",
     )
     parser.add_argument(
         "--model",
-        type=str,
+        dest="model",
         default="gpt-4o-mini",
-        help="OpenAI chat model to use (e.g. gpt-4o-mini, gpt-4o).",
+        help="OpenAI ChatCompletion model name",
     )
-    parser.add_argument(
-        "--tickers",
-        type=str,
-        nargs="+",
-        default=None,
-        help="Optional subset of tickers to process (space-separated). "
-             "If omitted, process all tickers in the input JSON.",
-    )
+    return parser.parse_args()
 
-    args = parser.parse_args()
 
-    input_path = Path(args.input_path)
-    output_path = Path(args.output_path)
+def main():
+    args = parse_args()
+    in_path = Path(args.in_path)
+    out_path = Path(args.out_path)
+    model = args.model
 
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input file not found: {input_path}")
+    if not in_path.exists():
+        raise FileNotFoundError(f"Input file not found: {in_path}")
 
-    with input_path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
+    # Load data from podcast_excerpts.py
+    excerpts_by_ticker, episodes = load_excerpts_and_episodes(in_path)
 
-    if not isinstance(data, dict):
-        raise ValueError(
-            "Expected input JSON to be a dict of {ticker: [snippets...]}. "
-            "Did you pass the output from podcast_excerpts.py?"
-        )
+    # Build list of per-ticker insights (what final.py expects)
+    insights = build_insights(excerpts_by_ticker, episodes, model=model)
 
-    all_tickers = sorted(list(data.keys()))
-    if args.tickers:
-        wanted = {t.upper() for t in args.tickers}
-        tickers_to_process = [t for t in all_tickers if t.upper() in wanted]
-    else:
-        tickers_to_process = all_tickers
+    # Write list -> JSON
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(insights, f, ensure_ascii=False, indent=2)
 
-    print(
-        f"[INFO] Building podcast insights for {len(tickers_to_process)} "
-        f"tickers using model {args.model}"
-    )
-
-    results: List[Dict[str, Any]] = []
-
-    for idx, ticker in enumerate(tickers_to_process, start=1):
-        snippets = data.get(ticker) or []
-        company_names = _get_company_names_for_ticker(ticker)
-
-        print(f"[INFO] [{idx}/{len(tickers_to_process)}] Processing {ticker} "
-              f"with {len(snippets)} snippets...")
-
-        insight = _call_openai_for_ticker(
-            ticker=ticker,
-            company_names=company_names,
-            snippets=snippets,
-            model=args.model,
-        )
-        results.append(insight)
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
-
-    print(
-        f"[OK] Wrote podcast insights for {len(results)} tickers to {output_path}"
-    )
+    print(f"[OK] Wrote podcast insights for {len(insights)} tickers to {out_path}")
 
 
 if __name__ == "__main__":
